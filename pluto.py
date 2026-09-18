@@ -62,8 +62,8 @@ LIVE_WEB_SETTINGS = {
 
 ARCHIVE_REGISTRY_SETTINGS = {
   "default_timeout_seconds": 20,
-  "default_requests_per_second": 0.5,
-  "rate_limited_requests_per_second": 0.25,
+  "default_requests_per_second": 10,
+  "rate_limited_requests_per_second": 5,
   "only": [],
   "exclude": [],
 }
@@ -1276,7 +1276,7 @@ def _stop_early_resolved(evidence: dict | None, threshold: int) -> bool:
 
 def _witness_concurrency_cap(min_interval: float) -> int:
   rate = 1.0 / min_interval
-  return max(1, min(6, math.ceil(rate * 2)))
+  return max(1, math.ceil(rate * 2))
 
 
 def run_witnesses(
