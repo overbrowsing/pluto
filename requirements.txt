@@ -1,7 +1,5 @@
 requests>=2.31
 pyarrow>=14.0
 duckdb>=0.10
-pandas>=2.0
-click>=8.1
 tldextract>=5.1
 tomli>=2.0; python_version < "3.11"
