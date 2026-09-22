@@ -2,7 +2,7 @@
 
 ## Overview
 
-*Pluto* is a research tool for measuring URL lifespan, link rot, and web content change. It reconstructs a URL’s history by checking the live web and every compatible archive in our [web-archive.txt](https://github.com/overbrowsing/web-archive.txt) registry, then classifies it from S0 (alive and unchanged) to S4 (confirmed disappearance). Findings are corroborated across archives rather than trusted from a single source, following the Roman maxim *testis unus, testis nullus* ("one witness is no witness"). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
+*Pluto* is a research tool for reconstructing web URL histories. It supports research into URL lifespan, link rot, content change, and web persistence by comparing live sites with compatible web archives listed in our [web-archive.txt](https://github.com/overbrowsing/web-archive.txt) registry. Findings are corroborated across archives rather than relying on a single source, following the Roman maxim testis unus, *testis unus, testis nullus* (one witness is no witness). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
 
 ## Installation
 
@@ -15,21 +15,11 @@
 
    2. Install Python ([download Python](https://python.org/downloads))
 
-   3. Install required packages:
+   3. Install dependencies:
 
       ```bash
       pip install -r requirements.txt
       ```
-
-   4. Place your list of URLs in the [input/](input/) folder.
-
-> [!TIP]
-> To reproduce [our study](#citing), download the 29.7M URL candidate set from Garg et al.'s *[Not Your Parents' Web](https://archive.org/details/nypw_urls_CDXfirstentry)*:
->
-> 1. Download [`nypw_downsampled_deep_firstcdx.gz`](https://archive.org/download/nypw_urls_CDXfirstentry/nypw_downsampled_deep_firstcdx.gz) (1.6 GB) and [`nypw_downsampled_root_firstcdx.gz`](https://archive.org/download/nypw_urls_CDXfirstentry/nypw_downsampled_root_firstcdx.gz) (305.7 MB)
-> 2. Place both files in the [input/](input/) folder.
->
-> See Garg et al.'s [dataset](https://doi.org/10.1109/JCDL67857.2025.00045) and [methodology](https://arxiv.org/abs/2507.14752) papers for details.
 
 ## Usage
 
@@ -46,10 +36,13 @@
 
       # Flags
 
-      --candidates <your/path/here>   # use a specific URL file/folder
-      --witnesses <ids>               # query specific witnesses, e.g. ia,cc,arq
-      --workers <n>                   # concurrent workers
-      --shard <i> --num-shards <n>    # split across HPC jobs
+      --input <path|domain>           # URL list file/folder or domain; default: input/ e.g. path/to/folder/ or example.com
+      --scope <root|hosts|deep|all>   # scope (default: all) e.g. root,hosts
+      --changes                       # fetch full capture histories to detect content changes (S1/S2); default: first and last capture only
+      --witnesses <ids>               # web archives to query (default: all) e.g. ia,arq
+      --workers <n>                   # concurrent workers e.g. 30
+      --shard <i>/<n>                 # HPC job shard, e.g. 2/8
+      --output <path>                 # output directory; default: output/ e.g. path/to/folder/
       ```
 
 > [!TIP]
@@ -73,7 +66,7 @@
 
 ## Results
 
-Results are written to the [output/](output/) folder as Parquet tables. Each table is append-only: every batch of new evidence lands as its own `part-*.parquet` file, so a run can be stopped and resumed without rewriting anything already on disk.
+Results are written as Parquet tables. Each batch is saved as a separate `part-*.parquet` file, so runs can be stopped and resumed without rewriting existing data.
 
 ```
 output/
@@ -82,7 +75,7 @@ output/
 │   ├── events/         # one row per detected state or content-change event
 │   ├── observations/   # one row per live-web query
 │   └── urls/           # one row per URL in the study
-├── raw/                # cached raw responses, content-addressed by witness
+├── raw/                # cached raw responses, packed into gzip JSONL segments per witness
 ├── .gitkeep
 ├── checkpoints.db
 ├── pluto.log
