@@ -5,25 +5,36 @@ from __future__ import annotations
 import sys
 sys.dont_write_bytecode = True
 
+import argparse
+import bisect
 import csv
+import duckdb
 import gzip
 import hashlib
+import heapq
 import json
 import logging
 import math
 import os
+import pyarrow as pa
+import pyarrow.parquet as pq
+import queue
 import random
 import re
+import requests
+import signal
 import socket
 import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as ReqConnectionError, RequestException, Timeout as ReqTimeout
 from typing import Any, Iterable
 from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -32,50 +43,66 @@ try:
 except ModuleNotFoundError:
   import tomli as tomllib
 
-import click
-import duckdb
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-import requests
-from requests.exceptions import ConnectionError as ReqConnectionError, RequestException, Timeout as ReqTimeout
-
 logger = logging.getLogger("pluto")
 
 # ------------------- Paths -------------------
 
 REPO_ROOT = Path(__file__).resolve().parent
 INPUT_DIR = REPO_ROOT / "input"
-GARG_DIR = INPUT_DIR / "garg"
 OUTPUT_DIR = REPO_ROOT / "output"
 REGISTRY_DIR = REPO_ROOT / "registry"
-DEFAULT_CANDIDATES_PATH = INPUT_DIR / "candidates.csv"
 
 UPSTREAM_REGISTRY = "https://github.com/overbrowsing/web-archive.txt.git"
 
 # ------------------- Settings -------------------
 
+USER_AGENT = "Pluto :: Overbrowsing"
+
 LIVE_WEB_SETTINGS = {
   "timeout_seconds": 10,
-  "requests_per_second": 50,
+  "requests_per_second": 100,
+  "breaker_failure_threshold": 200,
 }
 
 ARCHIVE_REGISTRY_SETTINGS = {
   "default_timeout_seconds": 20,
   "default_requests_per_second": 10,
-  "rate_limited_requests_per_second": 5,
+  "rate_limited_requests_per_second": 10,
   "only": [],
   "exclude": [],
+  "overrides": {"ia": {"timeout_seconds": 120}},
+}
+
+RATE_LIMITER_SETTINGS = {
+  "max_speedup": 4.0,
+  "max_slowdown": 10.0,
+  "ease_up_factor": 1.02,
+  "back_off_factor": 2.0,
+  "soft_back_off_factor": 1.25,
 }
 
 CIRCUIT_BREAKER_SETTINGS = {
   "failure_threshold": 5,
   "cooldown_seconds": 120,
+  "max_failed_health_checks": 30,
+  "max_failed_health_checks_before_first_success": 5,
+}
+
+CONCURRENCY_SETTINGS = {
+  "max_threads_per_witness": 128,
+  "assumed_latency_fraction_of_timeout": 0.5,
+  "warn_total_threads": 1500,
+}
+
+OUTPUT_SETTINGS = {
+  "flush_rows": 100_000,
+  "flush_interval_seconds": 1800,
+  "raw_enabled": True,
+  "raw_segment_bytes": 256 * 1024 * 1024,
+  "raw_compress_level": 1,
 }
 
 DEFAULT_CORROBORATION_THRESHOLD = 2
-
-CONTENT_REPLACEMENT_LENGTH_RATIO = 0.5
 
 
 @dataclass
@@ -130,13 +157,13 @@ class UrlParts:
 _TLD_EXTRACTOR = None
 
 
-def split_url(raw_url: str) -> UrlParts:
+def split_url(raw_url: str, canonical: str | None = None) -> UrlParts:
   global _TLD_EXTRACTOR
   if _TLD_EXTRACTOR is None:
     import tldextract
     _TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
 
-  canonical = canonicalize(raw_url)
+  canonical = canonical or canonicalize(raw_url)
   host = urlsplit(canonical).netloc
   suffix = _TLD_EXTRACTOR(host).suffix
   return UrlParts(canonical_url=canonical, domain=host, tld=f".{suffix}" if suffix else "")
@@ -222,8 +249,16 @@ def append_rows(output_dir: Path, table: str, rows: Iterable[dict]) -> Path | No
     return None
   out_dir = table_dir(output_dir, table)
   part_path = out_dir / f"part-{uuid.uuid4().hex}.parquet"
-  pq.write_table(pa.Table.from_pylist(rows, schema=TABLES[table]), part_path)
+  tmp_path = part_path.with_name(part_path.name + ".tmp")
+  pq.write_table(pa.Table.from_pylist(rows, schema=TABLES[table]), tmp_path)
+  os.replace(tmp_path, part_path)
   return part_path
+
+
+def _batches(result, size: int):
+  if hasattr(result, "to_arrow_reader"):
+    return result.to_arrow_reader(size)
+  return result.fetch_record_batch(size)
 
 
 def has_rows(output_dir: Path, table: str) -> bool:
@@ -286,8 +321,10 @@ def _compile_one(toml_path: Path) -> dict | None:
   endpoints = " ".join(filter(None, [cdx_endpoint, timemap_endpoint]))
   if "{collection}" in endpoints:
     collections = archive.get("scope", {}).get("collections", [])
-    if collections and isinstance(collections[0], dict):
-      entry["default_collection"] = collections[0].get("id")
+    ids = [c.get("id") for c in collections if isinstance(c, dict) and c.get("id")]
+    if ids:
+      entry["default_collection"] = ids[0]
+      entry["collections"] = ids
 
   return entry
 
@@ -300,16 +337,11 @@ def import_registry(dest: Path = REGISTRY_DIR, source: Path | None = None) -> in
   dest = Path(dest)
 
   def _copy_all(registry_dir: Path) -> int:
-    # Read every source descriptor into memory before touching dest, so this
-    # is safe even if source and dest are the same directory (e.g. --source
-    # pointed at REGISTRY_DIR itself).
     entries = [
       (src_file.parent.name, src_file.read_bytes())
       for src_file in sorted(registry_dir.glob("*/web-archive.txt"))
     ]
     dest.mkdir(parents=True, exist_ok=True)
-    # Only clear the per-archive subdirectories -- leave any top-level files
-    # (e.g. .gitkeep) in dest alone.
     for child in dest.iterdir():
       if child.is_dir():
         shutil.rmtree(child)
@@ -425,12 +457,13 @@ def archive_witnesses(registry_dir: Path = REGISTRY_DIR) -> list[WitnessConfig]:
     if entry.get("cdx_access") != "online" and entry.get("timemap_access") != "online":
       continue
     rps = limited_rps if entry.get("rate_limited", True) else default_rps
+    override = (settings.get("overrides") or {}).get(archive_id, {})
     out.append(WitnessConfig(
       name=f"archive:{archive_id}",
       adapter="WebArchiveAdapter",
       enabled=True,
-      timeout_seconds=timeout,
-      requests_per_second=rps,
+      timeout_seconds=override.get("timeout_seconds", timeout),
+      requests_per_second=override.get("requests_per_second", rps),
       extra={"registry_entry": entry},
     ))
   return out
@@ -463,6 +496,9 @@ class AdapterResult:
 
 class ArchiveAdapter:
   name: str = "base"
+  limiter_signals: frozenset = frozenset({"timeout", "connection_error", "server_error", "rate_limited"})
+  hard_signals: frozenset = frozenset({"rate_limited"})
+  breaker_signals: frozenset = frozenset({"timeout", "connection_error", "server_error", "rate_limited"})
 
   def __init__(self, config: Any):
     self.config = config
@@ -495,14 +531,50 @@ def _classify_status(http_status: int) -> str:
   return "other_response"
 
 
+def _make_session(pool_size: int = 64) -> requests.Session:
+  session = requests.Session()
+  adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+  session.mount("http://", adapter)
+  session.mount("https://", adapter)
+  return session
+
+
+LIVE_BODY_LIMIT = 1_000_000
+
+
+@dataclass
+class LiveResponse:
+  status_code: int
+  url: str
+  content_type: str
+  headers: dict
+  body: bytes
+
+
+def _read_prefix(response: requests.Response, limit: int) -> bytes:
+  chunks: list[bytes] = []
+  size = 0
+  for chunk in response.iter_content(chunk_size=65536):
+    if not chunk:
+      continue
+    chunks.append(chunk)
+    size += len(chunk)
+    if size >= limit:
+      break
+  return b"".join(chunks)[:limit]
+
+
 class LiveWebAdapter(ArchiveAdapter):
   name = "live_web"
+  limiter_signals = frozenset()
+  hard_signals = frozenset()
+  breaker_signals = frozenset({"dns_failure", "connection_error", "timeout"})
 
   def __init__(self, config):
     super().__init__(config)
-    self._session = requests.Session()
+    self._session = _make_session()
 
-  def query(self, url: str) -> requests.Response:
+  def query(self, url: str) -> LiveResponse:
     host = urlsplit(url).hostname
     if host:
       try:
@@ -510,8 +582,8 @@ class LiveWebAdapter(ArchiveAdapter):
       except socket.gaierror as exc:
         raise WitnessError("dns_failure", str(exc)) from exc
     try:
-      return self._session.get(
-        url, headers={"User-Agent": "Pluto :: Overbrowsing"},
+      response = self._session.get(
+        url, headers={"User-Agent": USER_AGENT},
         timeout=self.timeout_seconds(), allow_redirects=True, stream=True,
       )
     except ReqTimeout as exc:
@@ -520,9 +592,21 @@ class LiveWebAdapter(ArchiveAdapter):
       raise WitnessError("connection_error", str(exc)) from exc
     except RequestException as exc:
       raise WitnessError("malformed_response", str(exc)) from exc
+    try:
+      try:
+        body = _read_prefix(response, LIVE_BODY_LIMIT)
+      except Exception as exc:
+        raise WitnessError("malformed_response", f"body read failed: {type(exc).__name__}: {exc}") from exc
+      return LiveResponse(
+        status_code=response.status_code, url=response.url,
+        content_type=response.headers.get("Content-Type", ""),
+        headers=dict(response.headers), body=body,
+      )
+    finally:
+      response.close()
 
-  def parse(self, url: str, raw: requests.Response) -> AdapterResult:
-    body = raw.content[:1_000_000]
+  def parse(self, url: str, raw: LiveResponse) -> AdapterResult:
+    body = raw.body
     status = _classify_status(raw.status_code)
     error_class = {"access_restricted": "client_error", "server_error": "server_error"}.get(status, "")
     return AdapterResult(observations=[{
@@ -530,7 +614,7 @@ class LiveWebAdapter(ArchiveAdapter):
       "observation_time": None, "query_time": None,
       "status": status, "http_status": raw.status_code, "error_class": error_class,
       "redirect_target": raw.url if raw.url != url else "",
-      "mime_type": raw.headers.get("Content-Type", "").split(";")[0],
+      "mime_type": raw.content_type.split(";")[0],
       "content_length": len(body),
       "content_digest": content_digest(body), "response_digest": content_digest(body),
       "confidence": 1.0,
@@ -553,6 +637,7 @@ class WitnessRegistryEntry:
   timemap_endpoint: str | None = None
   timemap_access: str | None = None
   default_collection: str | None = None
+  collections: list[str] | None = None
   rate_limited: bool = True
   established: int | None = None
 
@@ -604,19 +689,56 @@ class WebArchiveAdapter(ArchiveAdapter):
     super().__init__(config)
     self.entry = WitnessRegistryEntry.from_dict(config.extra["registry_entry"])
     self.name = f"archive:{self.entry.id}"
-    self._session = requests.Session()
+    self._session = _make_session()
+    self.history = config.extra.get("history", "full")
+    self._latest_differs = 0
+    self._latest_same = 0
 
-  def query(self, url: str) -> tuple[str, str]:
+  def _collection_ids(self) -> list[str | None]:
+    return list(self.entry.collections) if self.entry.collections else [self.entry.default_collection]
+
+  def query(self, url: str) -> list[tuple[str, str]]:
     if self.entry.usable_cdx():
-      return "cdx", self._get_paginated_cdx(url)
+      if self.history == "lifespan":
+        return [item for collection in self._collection_ids() for item in self._get_first_and_last(url, collection)]
+      return [("cdx", self._get_paginated_cdx(url, collection)) for collection in self._collection_ids()]
     if self.entry.usable_timemap():
-      return "timemap", self._get(_fill_template(self.entry.timemap_endpoint, url, self.entry))
+      return [
+        ("timemap", self._get(_fill_template(
+          self.entry.timemap_endpoint, url, replace(self.entry, default_collection=collection))))
+        for collection in self._collection_ids()
+      ]
     raise WitnessError("client_error", f"{self.entry.id} has no usable online endpoint")
 
   _MAX_CDX_PAGES = 200
 
-  def _get_paginated_cdx(self, url: str) -> str:
-    endpoint = _fill_template(self.entry.cdx_endpoint, url, self.entry)
+  _LATEST_UNRELIABLE_AFTER = 20
+
+  def _get_first_and_last(self, url: str, collection: str | None) -> list[tuple[str, str]]:
+    entry = replace(self.entry, default_collection=collection)
+    endpoint = _fill_template(entry.cdx_endpoint, url, entry)
+    sep = "&" if "?" in endpoint else "?"
+    first = self._get(f"{endpoint}{sep}output=json&limit=2")
+    if not first.strip() or self._cdx_is_empty(first):
+      return [("cdx", first)]
+    earliest = self._parse_cdx(first)
+    if len(earliest) != 2:
+      return [("cdx", first)]
+    last = self._get(f"{endpoint}{sep}output=json&sort=reverse&limit=1")
+    latest = self._parse_cdx(last) if last.strip() else []
+    if len(latest) == 1:
+      if latest[0]["capture_time"] != earliest[0]["capture_time"]:
+        self._latest_differs += 1
+      else:
+        self._latest_same += 1
+    return [("cdx", first), ("cdx", last)]
+
+  def latest_unreliable(self) -> bool:
+    return self._latest_differs == 0 and self._latest_same >= self._LATEST_UNRELIABLE_AFTER
+
+  def _get_paginated_cdx(self, url: str, collection: str | None) -> str:
+    entry = replace(self.entry, default_collection=collection)
+    endpoint = _fill_template(entry.cdx_endpoint, url, entry)
     sep = "&" if "?" in endpoint else "?"
     base = f"{endpoint}{sep}output=json&showResumeKey=true"
 
@@ -648,7 +770,7 @@ class WebArchiveAdapter(ArchiveAdapter):
         header, body = body[0], body[1:]
       elif body and body[0] == header:
         body = body[1:]
-      records.extend(body)
+      records.extend(row for row in body if row)
 
       if not new_resume_key or new_resume_key == resume_key:
         break
@@ -663,7 +785,7 @@ class WebArchiveAdapter(ArchiveAdapter):
   def _get(self, full_url: str) -> str:
     try:
       resp = self._session.get(full_url, timeout=self.timeout_seconds(),
-                   headers={"User-Agent": "pluto-research-bot/0.1"})
+                   headers={"User-Agent": USER_AGENT})
     except ReqTimeout as exc:
       raise WitnessError("timeout", str(exc)) from exc
     except ReqConnectionError as exc:
@@ -681,9 +803,21 @@ class WebArchiveAdapter(ArchiveAdapter):
       raise WitnessError("client_error", f"{self.entry.id} HTTP {resp.status_code}")
     return resp.text
 
-  def parse(self, url: str, raw: tuple[str, str]) -> AdapterResult:
-    kind, text = raw
-    if not text.strip():
+  def parse(self, url: str, raw: list[tuple[str, str]]) -> AdapterResult:
+    all_captures: list[dict] = []
+    any_text = False
+    for kind, text in raw:
+      if not text.strip() or (kind == "cdx" and self._cdx_is_empty(text)):
+        continue
+      any_text = True
+      parsed = self._parse_cdx(text) if kind == "cdx" else self._parse_timemap(text)
+      if not parsed and (text.lstrip()[:1] == "<" or kind == "cdx"):
+        raise WitnessError(
+          "malformed_response",
+          f"{self.entry.id} returned something that is not capture data: {' '.join(text.split())[:100]!r}",
+        )
+      all_captures.extend(parsed)
+    if not any_text:
       return AdapterResult(observations=[{
         "url_id": None, "observer": self.name,
         "observation_time": None, "query_time": None,
@@ -692,36 +826,55 @@ class WebArchiveAdapter(ArchiveAdapter):
         "mime_type": "", "content_length": 0,
         "content_digest": "", "response_digest": "", "confidence": 1.0,
       }])
-    captures = self._parse_cdx(text) if kind == "cdx" else self._parse_timemap(text)
     now = datetime.now(timezone.utc)
-    captures = [c for c in captures if c["capture_time"] <= now]
-    for cap in captures:
+    all_captures = [c for c in all_captures if c["capture_time"] <= now]
+    if self.history == "lifespan":
+      unique: dict[tuple, dict] = {}
+      for cap in all_captures:
+        unique.setdefault((cap["capture_time"], cap["memento_url"], cap["digest"], cap["record_id"]), cap)
+      all_captures = list(unique.values())
+    for cap in all_captures:
       cap["archive"] = self.name
-    return AdapterResult(captures=captures)
+    return AdapterResult(captures=all_captures)
+
+  @staticmethod
+  def _cdx_is_empty(text: str) -> bool:
+    try:
+      data = json.loads(text)
+    except json.JSONDecodeError:
+      return False
+    return isinstance(data, list) and not any(row for row in data[1:])
 
   def _parse_cdx(self, text: str) -> list[dict]:
     text = text.strip()
     try:
       data = json.loads(text)
+      if isinstance(data, list) and not data:
+        return []
       if isinstance(data, list) and data and isinstance(data[0], list):
         header, *records = data
         idx = {name: i for i, name in enumerate(header)}
         out = []
         for rec in records:
-          capture_time = _parse_timestamp(rec[idx["timestamp"]]) if "timestamp" in idx else None
-          if capture_time is None:
+          if not rec:
             continue
-          out.append({
-            "capture_time": capture_time,
-            "memento_url": rec[idx["original"]] if "original" in idx else "",
-            "mime_type": rec[idx.get("mimetype", -1)] if "mimetype" in idx else "",
-            "status": str(rec[idx.get("statuscode", -1)]) if "statuscode" in idx else "",
-            "digest": rec[idx.get("digest", -1)] if "digest" in idx else "",
-            "warc_file": rec[idx.get("filename", -1)] if "filename" in idx else "",
-            "record_id": rec[idx.get("timestamp", -1)] if "timestamp" in idx else "",
-            "query_status": "success",
-            "content_length": _safe_int(rec[idx["length"]]) if "length" in idx else None,
-          })
+          try:
+            capture_time = _parse_timestamp(rec[idx["timestamp"]]) if "timestamp" in idx else None
+            if capture_time is None:
+              continue
+            out.append({
+              "capture_time": capture_time,
+              "memento_url": rec[idx["original"]] if "original" in idx else "",
+              "mime_type": rec[idx.get("mimetype", -1)] if "mimetype" in idx else "",
+              "status": str(rec[idx.get("statuscode", -1)]) if "statuscode" in idx else "",
+              "digest": rec[idx.get("digest", -1)] if "digest" in idx else "",
+              "warc_file": rec[idx.get("filename", -1)] if "filename" in idx else "",
+              "record_id": rec[idx.get("timestamp", -1)] if "timestamp" in idx else "",
+              "query_status": "success",
+              "content_length": _safe_int(rec[idx["length"]]) if "length" in idx else None,
+            })
+          except (IndexError, KeyError, TypeError):
+            continue
         return out
     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
       pass
@@ -734,6 +887,11 @@ class WebArchiveAdapter(ArchiveAdapter):
       try:
         rec = json.loads(line)
       except json.JSONDecodeError:
+        capture = self._parse_cdx_text_line(line)
+        if capture is not None:
+          out.append(capture)
+        continue
+      if not isinstance(rec, dict):
         continue
       capture_time = _parse_timestamp(rec.get("timestamp", ""))
       if capture_time is None:
@@ -750,6 +908,32 @@ class WebArchiveAdapter(ArchiveAdapter):
         "content_length": _safe_int(rec.get("length")),
       })
     return out
+
+  _CDX_TIMESTAMP_RE = re.compile(r"\d{4,14}")
+
+  def _parse_cdx_text_line(self, line: str) -> dict | None:
+    fields = line.split()
+    if len(fields) < 7 or not self._CDX_TIMESTAMP_RE.fullmatch(fields[1]):
+      return None
+    capture_time = _parse_timestamp(fields[1])
+    if capture_time is None:
+      return None
+    offset = length = filename = None
+    if len(fields) == 7:
+      length = fields[6]
+    elif len(fields) >= 11:
+      length, offset, filename = fields[8], fields[9], fields[10]
+    return {
+      "capture_time": capture_time,
+      "memento_url": fields[2],
+      "mime_type": fields[3],
+      "status": fields[4],
+      "digest": fields[5],
+      "warc_file": filename or "",
+      "record_id": f"{offset}:{length}" if offset is not None else fields[1],
+      "query_status": "success",
+      "content_length": _safe_int(length),
+    }
 
   _LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="memento"[^,]*?datetime="([^"]+)"')
 
@@ -801,9 +985,10 @@ ADAPTER_REGISTRY = {"LiveWebAdapter": LiveWebAdapter, "WebArchiveAdapter": WebAr
 
 # ------------------- Reliability -------------------
 
-PENDING, RUNNING, SUCCESS, RETRY, FAILED, PERMANENT_FAILURE, SKIPPED_EARLY_STOP = (
-  "PENDING", "RUNNING", "SUCCESS", "RETRY", "FAILED", "PERMANENT_FAILURE", "SKIPPED_EARLY_STOP",
+SUCCESS, RETRY, PERMANENT_FAILURE, SKIPPED_EARLY_STOP = (
+  "SUCCESS", "RETRY", "PERMANENT_FAILURE", "SKIPPED_EARLY_STOP",
 )
+_DONE_STATES = (SUCCESS, PERMANENT_FAILURE, SKIPPED_EARLY_STOP)
 
 _CHECKPOINT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -818,14 +1003,30 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 """
 
 
+_UPSERT_SQL = """
+INSERT INTO checkpoints (url_id, witness, state, attempts, last_error_class, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(url_id, witness) DO UPDATE SET
+    state=excluded.state,
+    attempts=checkpoints.attempts + excluded.attempts,
+    last_error_class=COALESCE(excluded.last_error_class, checkpoints.last_error_class),
+    updated_at=excluded.updated_at
+"""
+
+_COUNTED_STATES = frozenset({SUCCESS, RETRY, PERMANENT_FAILURE})
+
+
 class CheckpointStore:
 
   def __init__(self, db_path: Path):
     self.db_path = Path(db_path)
     self.db_path.parent.mkdir(parents=True, exist_ok=True)
-    self._conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+    self._conn = sqlite3.connect(
+      self.db_path, isolation_level=None, check_same_thread=False, timeout=60,
+    )
     self._lock = threading.Lock()
     with self._lock, self._cursor() as cur:
+      cur.execute("PRAGMA synchronous=OFF")
       cur.execute(_CHECKPOINT_SCHEMA)
 
   @contextmanager
@@ -836,29 +1037,24 @@ class CheckpointStore:
     finally:
       cur.close()
 
-  def get_state(self, url_id: str, witness: str) -> str:
-    with self._lock, self._cursor() as cur:
-      cur.execute("SELECT state FROM checkpoints WHERE url_id=? AND witness=?", (url_id, witness))
-      row = cur.fetchone()
-      return row[0] if row else PENDING
-
-  def is_done(self, url_id: str, witness: str) -> bool:
-    return self.get_state(url_id, witness) in (SUCCESS, PERMANENT_FAILURE, SKIPPED_EARLY_STOP)
-
-  def mark_running(self, url_id: str, witness: str) -> None:
-    self._upsert(url_id, witness, RUNNING, increment_attempts=True)
-
-  def mark_success(self, url_id: str, witness: str) -> None:
-    self._upsert(url_id, witness, SUCCESS)
+  def done_pairs(self):
+    with self._lock:
+      cur = self._conn.cursor()
+      try:
+        cur.execute(
+          "SELECT url_id, witness FROM checkpoints WHERE state IN (?, ?, ?) ORDER BY url_id",
+          _DONE_STATES,
+        )
+        while True:
+          rows = cur.fetchmany(100_000)
+          if not rows:
+            return
+          yield from rows
+      finally:
+        cur.close()
 
   def mark_retry(self, url_id: str, witness: str, error_class: str) -> None:
-    self._upsert(url_id, witness, RETRY, last_error_class=error_class)
-
-  def mark_permanent_failure(self, url_id: str, witness: str, error_class: str) -> None:
-    self._upsert(url_id, witness, PERMANENT_FAILURE, last_error_class=error_class)
-
-  def mark_skipped_early_stop(self, url_id: str, witness: str) -> None:
-    self._upsert(url_id, witness, SKIPPED_EARLY_STOP)
+    self.mark_many([(url_id, witness, RETRY, error_class)])
 
   def attempts(self, url_id: str, witness: str) -> int:
     with self._lock, self._cursor() as cur:
@@ -866,23 +1062,22 @@ class CheckpointStore:
       row = cur.fetchone()
       return row[0] if row else 0
 
-  def _upsert(self, url_id, witness, state, increment_attempts=False, last_error_class=None) -> None:
+  def mark_many(self, entries: list[tuple[str, str, str, str | None]]) -> None:
+    if not entries:
+      return
     now = datetime.now(timezone.utc).isoformat()
+    params = [
+      (url_id, witness, state, 1 if state in _COUNTED_STATES else 0, error_class, now)
+      for url_id, witness, state, error_class in entries
+    ]
     with self._lock, self._cursor() as cur:
-      cur.execute("SELECT attempts FROM checkpoints WHERE url_id=? AND witness=?", (url_id, witness))
-      row = cur.fetchone()
-      attempts = (row[0] if row else 0) + (1 if increment_attempts else 0)
-      cur.execute(
-        """
-                INSERT INTO checkpoints (url_id, witness, state, attempts, last_error_class, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url_id, witness) DO UPDATE SET
-                    state=excluded.state, attempts=excluded.attempts,
-                    last_error_class=COALESCE(excluded.last_error_class, checkpoints.last_error_class),
-                    updated_at=excluded.updated_at
-                """,
-        (url_id, witness, state, attempts, last_error_class, now),
-      )
+      cur.execute("BEGIN")
+      try:
+        cur.executemany(_UPSERT_SQL, params)
+      except BaseException:
+        cur.execute("ROLLBACK")
+        raise
+      cur.execute("COMMIT")
 
   def close(self) -> None:
     self._conn.close()
@@ -924,8 +1119,11 @@ def should_retry(error_class: str, attempts_so_far: int) -> bool:
 class CircuitBreaker:
   failure_threshold: int = 5
   cooldown_seconds: float = 120
+  max_failed_health_checks: int = 30
+  max_failed_health_checks_before_first_success: int = 5
 
   _consecutive_failures: int = field(default=0, init=False)
+  _failed_health_checks: int = field(default=0, init=False)
   _open_since: float | None = field(default=None, init=False)
   _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
@@ -937,7 +1135,30 @@ class CircuitBreaker:
   def record_success(self) -> None:
     with self._lock:
       self._consecutive_failures = 0
+      self._failed_health_checks = 0
       self._open_since = None
+
+  def record_failed_health_check(self) -> None:
+    with self._lock:
+      self._failed_health_checks += 1
+      self._open_since = time.monotonic()
+
+  @property
+  def given_up(self) -> bool:
+    with self._lock:
+      return self._open_since is not None and self._failed_health_checks >= self.max_failed_health_checks
+
+  @property
+  def failed_health_checks(self) -> int:
+    with self._lock:
+      return self._failed_health_checks
+
+  @property
+  def seconds_until_health_check(self) -> float:
+    with self._lock:
+      if self._open_since is None:
+        return 0.0
+      return max(0.0, self.cooldown_seconds - (time.monotonic() - self._open_since))
 
   def record_failure(self) -> None:
     with self._lock:
@@ -949,24 +1170,52 @@ class CircuitBreaker:
     with self._lock:
       return self._open_since is not None and (time.monotonic() - self._open_since) >= self.cooldown_seconds
 
-  def allow_request(self) -> bool:
-    return not self.is_open
+
+_SHUTDOWN = threading.Event()
+
+
+class _ShuttingDown(BaseException):
+  pass
 
 
 class RateLimiter:
 
-  def __init__(self, requests_per_second: float):
-    self.min_interval = 1.0 / max(requests_per_second, 0.001)
+  def __init__(self, requests_per_second: float, settings: dict = RATE_LIMITER_SETTINGS):
+    base_interval = 1.0 / max(requests_per_second, 0.001)
+    self._floor_interval = base_interval / settings["max_speedup"]
+    self._ceiling_interval = base_interval * settings["max_slowdown"]
+    self._ease_up_factor = settings["ease_up_factor"]
+    self._back_off_factor = settings["back_off_factor"]
+    self._soft_back_off_factor = settings.get("soft_back_off_factor", settings["back_off_factor"])
+    self._interval = base_interval
     self._lock = threading.Lock()
     self._next_allowed = 0.0
 
   def wait(self) -> None:
     with self._lock:
+      interval = self._interval
       now = time.monotonic()
       sleep_for = max(0.0, self._next_allowed - now)
-      self._next_allowed = max(now, self._next_allowed) + self.min_interval
-    if sleep_for > 0:
-      time.sleep(sleep_for)
+      self._next_allowed = max(now, self._next_allowed) + interval
+    if sleep_for > 0 and _SHUTDOWN.wait(sleep_for):
+      raise _ShuttingDown()
+
+  def record_success(self) -> None:
+    with self._lock:
+      self._interval = max(self._floor_interval, self._interval / self._ease_up_factor)
+
+  def record_failure(self, hard: bool = True) -> None:
+    factor = self._back_off_factor if hard else self._soft_back_off_factor
+    with self._lock:
+      self._interval = min(self._ceiling_interval, self._interval * factor)
+
+  @property
+  def current_rps(self) -> float:
+    return 1.0 / self._interval
+
+  @property
+  def min_interval(self) -> float:
+    return self._floor_interval
 
 
 # ------------------- Stage 1 -------------------
@@ -1032,19 +1281,29 @@ def _existing_url_ids(output_dir: Path) -> set[str]:
     return set()
   con = duckdb.connect()
   glob = str(table_dir(output_dir, "urls") / "*.parquet")
-  return set(con.execute(f"SELECT DISTINCT url_id FROM read_parquet('{glob}')").fetchdf()["url_id"])
+  ids: set[str] = set()
+  reader = _batches(con.execute(f"SELECT url_id FROM read_parquet('{glob}')"), 100_000)
+  for batch in reader:
+    ids.update(batch.column("url_id").to_pylist())
+  return ids
 
 
-def write_urls_table(output_dir: Path, urls: list[dict]) -> tuple[Path | None, int, int]:
-  already = _existing_url_ids(output_dir)
+def write_urls_table(
+  output_dir: Path,
+  urls: list[dict],
+  already: set[str] | None = None,
+) -> tuple[Path | None, int, int]:
+  if already is None:
+    already = _existing_url_ids(output_dir)
   rows, skipped = [], 0
   for row in urls:
-    uid = url_id(row["url"])
+    canonical = canonicalize(row["url"])
+    uid = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
     if uid in already:
       skipped += 1
       continue
     already.add(uid)
-    parts = split_url(row["url"])
+    parts = split_url(row["url"], canonical)
     year_str = row.get("first_observed_year", "")
     rows.append({
       "url_id": uid,
@@ -1070,13 +1329,14 @@ def sample_from_files(
   total_added = total_skipped = 0
   n_rows_seen = 0
   last_path: Path | None = None
+  already = _existing_url_ids(output_dir)
 
   def write_batch(batch: list[dict]) -> None:
     nonlocal total_added, total_skipped, last_path, n_rows_seen
     if not batch:
       return
     n_rows_seen += len(batch)
-    path, added, skipped = write_urls_table(output_dir, batch)
+    path, added, skipped = write_urls_table(output_dir, batch, already)
     total_added += added
     total_skipped += skipped
     if path is not None:
@@ -1114,9 +1374,6 @@ def sample_from_files(
   return last_path, total_added, total_skipped
 
 
-GARG_FILENAMES = ("nypw_downsampled_root_firstcdx.gz", "nypw_downsampled_deep_firstcdx.gz")
-
-
 def _resolve_candidate_paths(paths: list[Path]) -> list[Path]:
   resolved: list[Path] = []
   for p in paths:
@@ -1129,32 +1386,310 @@ def _resolve_candidate_paths(paths: list[Path]) -> list[Path]:
 
 
 def _default_candidates() -> list[Path]:
-  garg = [GARG_DIR / name for name in GARG_FILENAMES if (GARG_DIR / name).exists()]
-  if not garg:
-    garg = [INPUT_DIR / name for name in GARG_FILENAMES if (INPUT_DIR / name).exists()]
-  if garg:
-    return garg
-  if DEFAULT_CANDIDATES_PATH.exists():
-    return [DEFAULT_CANDIDATES_PATH]
   return sorted(INPUT_DIR.glob("*.csv")) + sorted(INPUT_DIR.glob("*.gz"))
+
+
+# ------------------- Discover -------------------
+
+
+def _discover_cdx_bases(entry: dict) -> list[str]:
+  endpoint = entry.get("cdx_endpoint") or ""
+  if "{collection}" not in endpoint:
+    base = endpoint.split("?", 1)[0]
+    return [base] if base else []
+  collections = entry.get("collections") or (
+    [entry["default_collection"]] if entry.get("default_collection") else [])
+  return [endpoint.replace("{collection}", c).split("?", 1)[0] for c in collections if c]
+
+
+def _discover_normalise_domain(domain: str) -> str:
+  return domain.lower().replace("http://", "").replace("https://", "").strip("/")
+
+
+def _discover_host(url: str) -> str:
+  from urllib.parse import urlparse
+  try:
+    return (urlparse(url).hostname or "").lower()
+  except ValueError:
+    return ""
+
+
+def _discover_in_domain(host: str, domain: str) -> bool:
+  return bool(host) and (host == domain or host.endswith("." + domain))
+
+
+_WWW_LABEL_RE = re.compile(r"^www\d*$")
+
+
+def _discover_canonical_host(host: str) -> str:
+  labels = host.split(".")
+  if len(labels) > 1 and _WWW_LABEL_RE.match(labels[0]):
+    return ".".join(labels[1:])
+  return host
+
+
+def _discover_has_coverage(domain: str, cdx_base_url: str, session: requests.Session) -> bool | str | None:
+  params = {"url": f"{domain}/", "matchType": "domain", "output": "text", "limit": 1}
+  for attempt in range(1, 4):
+    try:
+      response = session.get(cdx_base_url, params=params,
+                  headers={"User-Agent": USER_AGENT}, timeout=60)
+      response.raise_for_status()
+      text = response.text.strip()
+      if text[:1] == "<":
+        raise RequestException("response looked like an HTML/error page, not CDX data")
+      return bool(text)
+    except RequestException as error:
+      logger.info("discover: coverage check %s attempt %d/3 failed: %s", cdx_base_url, attempt, error)
+      time.sleep(attempt * 3)
+  return "blocked"
+
+
+def _fetch_domain_captures(domain: str, cdx_base_url: str, session: requests.Session,
+                page_size: int, stats: dict | None = None):
+  resume_key = None
+  while True:
+    params = {
+      "url": f"{domain}/",
+      "matchType": "domain",
+      "output": "text",
+      "limit": page_size,
+      "showResumeKey": "true",
+    }
+    if resume_key:
+      params["resumeKey"] = resume_key
+
+    text = None
+    for attempt in range(1, 6):
+      try:
+        response = session.get(cdx_base_url, params=params,
+                    headers={"User-Agent": USER_AGENT}, timeout=180)
+        response.raise_for_status()
+        candidate = response.text.rstrip("\n")
+        if candidate.lstrip()[:1] == "<":
+          raise RequestException("response looked like an HTML/error page, not CDX data")
+        text = candidate
+        break
+      except RequestException as error:
+        logger.info("discover: %s attempt %d/5 failed: %s", cdx_base_url, attempt, error)
+        time.sleep(attempt * 5)
+    if text is None:
+      if stats is not None:
+        stats["incomplete"] = True
+      break
+    if not text.strip():
+      break
+
+    parts = text.split("\n\n")
+    data = parts[0]
+    next_key = parts[1].strip() if len(parts) > 1 else None
+
+    for line in data.splitlines():
+      fields = line.split()
+      if len(fields) < 3:
+        continue
+      yield fields[1], fields[2]
+
+    if not next_key or next_key == resume_key:
+      break
+    resume_key = next_key
+
+
+_SCOPE_ALIASES = {
+  "root": frozenset({"root"}),
+  "hosts": frozenset({"hosts"}),
+  "deep": frozenset({"deep"}),
+  "all": frozenset({"hosts", "deep"}),
+}
+
+
+def _parse_scope(value: str) -> frozenset[str]:
+  tokens = {t.strip().lower() for t in value.split(",") if t.strip()}
+  unknown = tokens - set(_SCOPE_ALIASES)
+  if unknown:
+    raise UIError(f"--scope: unknown value(s) {', '.join(sorted(unknown))} -- "
+            "use root, hosts, deep, or all (comma-separated to combine, e.g. 'root,deep').")
+  resolved: set[str] = set()
+  for t in tokens:
+    resolved |= _SCOPE_ALIASES[t]
+  return frozenset(resolved)
+
+
+def discover_candidates(
+  domain: str,
+  scope: frozenset[str] | set[str] = frozenset({"hosts", "deep"}),
+  registry_dir: Path = REGISTRY_DIR,
+  only_archives: list[str] | None = None,
+  page_size: int = 500_000,
+) -> list[dict]:
+  scope = frozenset(scope)
+  if not scope <= {"root", "hosts", "deep"}:
+    raise ValueError(f"scope must be drawn from root/hosts/deep, got {scope!r}")
+
+  domain = _discover_normalise_domain(domain)
+  entries = [e for e in compile_archives(registry_dir)
+       if e.get("cdx_endpoint") and e.get("cdx_access") == "online"]
+  if only_archives:
+    wanted = {a.strip().lower() for a in only_archives}
+    entries = [e for e in entries if e["id"] in wanted]
+  if not entries:
+    raise UIError("No archives with an online CDX endpoint found in the registry "
+            "(run `python pluto.py fetch-archives` first, or check --archives).")
+
+  earliest_host: dict[str, str] = {}
+  earliest_url: dict[str, str] = {}
+  session = requests.Session()
+
+  UI.log("info", f"Searching {len(entries)} {_plural(len(entries), 'archive')} for {domain} ({'/'.join(sorted(scope))})...")
+  for i, entry in enumerate(entries):
+    last = i == len(entries) - 1
+    bases = _discover_cdx_bases(entry)
+    if not bases:
+      UI.leaf(f"{entry['id']}: skipped (no collection id on file)", last=last)
+      continue
+    count = 0
+    stats = {"incomplete": False}
+    any_coverage = False
+    for base in bases:
+      coverage = _discover_has_coverage(domain, base, session)
+      if coverage is False:
+        continue
+      if coverage == "blocked":
+        stats["incomplete"] = True
+        continue
+      any_coverage = True
+      for timestamp, original_url in _fetch_domain_captures(domain, base, session, page_size, stats):
+        host = _discover_host(original_url)
+        if not _discover_in_domain(host, domain):
+          continue
+        count += 1
+        canonical_host = _discover_canonical_host(host)
+        if canonical_host not in earliest_host or timestamp < earliest_host[canonical_host]:
+          earliest_host[canonical_host] = timestamp
+        if original_url not in earliest_url or timestamp < earliest_url[original_url]:
+          earliest_url[original_url] = timestamp
+    if not any_coverage and not stats["incomplete"]:
+      UI.leaf(f"{entry['id']}: no coverage", last=last)
+      continue
+    flag = " (stopped early, likely incomplete: rate-limited or unresponsive)" if stats["incomplete"] else ""
+    UI.leaf(f"{entry['id']}: {count:,} {_plural(count, 'capture')}{flag}", last=last)
+
+  rows = []
+  if "hosts" in scope:
+    rows += [{"url": f"https://{host}/", "first_observed_year": ts[:4], "url_type": "root"}
+         for host, ts in earliest_host.items()]
+  if "root" in scope and "hosts" not in scope:
+    ts = earliest_host.get(_discover_canonical_host(domain)) or \
+      (min(earliest_host.values()) if earliest_host else None)
+    if ts:
+      rows.append({"url": f"https://{domain}/", "first_observed_year": ts[:4], "url_type": "root"})
+  if "deep" in scope:
+    existing_urls = {r["url"] for r in rows}
+    rows += [{"url": url, "first_observed_year": ts[:4], "url_type": "deep"}
+         for url, ts in earliest_url.items() if url not in existing_urls]
+  return rows
 
 
 # ------------------- Stage 2 -------------------
 
 
-def store_raw(output_dir: Path, witness: str, uid: str, payload: Any) -> str:
-  if isinstance(payload, bytes):
-    raw_bytes, suffix = payload, ".bin"
-  else:
-    raw_bytes, suffix = json.dumps(payload, default=str, sort_keys=True).encode("utf-8"), ".json"
+class _RawSegment:
 
-  digest = hashlib.sha256(raw_bytes).hexdigest()
-  out_dir = Path(output_dir) / "raw" / witness / digest[:2]
-  out_dir.mkdir(parents=True, exist_ok=True)
-  out_path = out_dir / f"{digest}{suffix}"
-  if not out_path.exists():
-    out_path.write_bytes(raw_bytes)
-  return digest
+  def __init__(self, directory: Path, tag: str, segment_bytes: int, compress_level: int):
+    self._directory = directory
+    self._tag = tag
+    self._segment_bytes = segment_bytes
+    self._compress_level = compress_level
+    self._lock = threading.Lock()
+    self._fh = None
+    self._written = 0
+    self._index = 0
+
+  def _rotate(self) -> None:
+    if self._fh is not None:
+      self._fh.close()
+    self._directory.mkdir(parents=True, exist_ok=True)
+    name = f"{self._tag}-{os.getpid()}-{int(time.time())}-{self._index:05d}.jsonl.gz"
+    self._index += 1
+    self._fh = gzip.open(self._directory / name, "wb", compresslevel=self._compress_level)
+    self._written = 0
+
+  def write(self, line: bytes) -> None:
+    with self._lock:
+      if self._fh is None or self._written >= self._segment_bytes:
+        self._rotate()
+      self._fh.write(line)
+      self._written += len(line)
+
+  def flush(self) -> None:
+    with self._lock:
+      if self._fh is not None:
+        self._fh.flush()
+
+  def close(self) -> None:
+    with self._lock:
+      if self._fh is not None:
+        self._fh.close()
+        self._fh = None
+
+
+def _raw_for_storage(raw: Any) -> Any:
+  if isinstance(raw, LiveResponse):
+    return {"status_code": raw.status_code, "url": raw.url, "headers": raw.headers,
+        "body_bytes": len(raw.body)}
+  return raw
+
+
+def _raw_is_empty(payload: Any) -> bool:
+  if isinstance(payload, list):
+    return all(
+      not (isinstance(item, (tuple, list)) and len(item) == 2 and str(item[1]).strip())
+      for item in payload
+    )
+  return payload is None
+
+
+class RawStore:
+
+  def __init__(self, output_dir: Path, tag: str = "single", settings: dict = OUTPUT_SETTINGS):
+    self.enabled = bool(settings["raw_enabled"])
+    self._root = Path(output_dir) / "raw"
+    self._tag = tag
+    self._segment_bytes = settings["raw_segment_bytes"]
+    self._compress_level = settings["raw_compress_level"]
+    self._segments: dict[str, _RawSegment] = {}
+    self._lock = threading.Lock()
+
+  def _segment(self, witness: str) -> _RawSegment:
+    segment = self._segments.get(witness)
+    if segment is None:
+      with self._lock:
+        segment = self._segments.get(witness)
+        if segment is None:
+          segment = _RawSegment(self._root / witness, self._tag, self._segment_bytes, self._compress_level)
+          self._segments[witness] = segment
+    return segment
+
+  def write(self, witness: str, uid: str, raw: Any) -> None:
+    if not self.enabled:
+      return
+    payload = _raw_for_storage(raw)
+    if _raw_is_empty(payload):
+      return
+    record = {
+      "url_id": uid, "witness": witness,
+      "stored_at": datetime.now(timezone.utc).isoformat(), "payload": payload,
+    }
+    line = (json.dumps(record, default=str, separators=(",", ":")) + "\n").encode("utf-8")
+    self._segment(witness).write(line)
+
+  def flush(self) -> None:
+    for segment in list(self._segments.values()):
+      segment.flush()
+
+  def close(self) -> None:
+    for segment in list(self._segments.values()):
+      segment.close()
 
 
 @dataclass
@@ -1170,73 +1705,92 @@ def build_runtimes(witness_configs: list[WitnessConfig], breaker_cfg: dict) -> d
   for wc in witness_configs:
     if not wc.enabled:
       continue
+    cfg = dict(breaker_cfg)
+    if wc.name == "live_web":
+      cfg["failure_threshold"] = LIVE_WEB_SETTINGS["breaker_failure_threshold"]
     runtimes[wc.name] = WitnessRuntime(
       config=wc,
       adapter=ADAPTER_REGISTRY[wc.adapter](wc),
       limiter=RateLimiter(wc.requests_per_second),
-      breaker=CircuitBreaker(**breaker_cfg),
+      breaker=CircuitBreaker(**cfg),
     )
   return runtimes
 
 
-def _raw_for_storage(raw):
-  if isinstance(raw, requests.Response):
-    return {"status_code": raw.status_code, "headers": dict(raw.headers),
-        "url": raw.url, "text": raw.text[:200_000]}
-  return raw
+_UNEXPECTED_ERRORS = [0]
 
 
-def _process_unit(uid, witness, original_url, runtime, output_dir, store) -> dict:
-  if runtime.breaker.is_open:
-    if not runtime.breaker.ready_for_health_check():
+def _process_unit(uid, witness, original_url, runtime, raw_store, store) -> dict:
+  breaker = runtime.breaker
+  if breaker.is_open:
+    if not breaker.ready_for_health_check():
       return {"outcome": "skipped_circuit_open"}
     if runtime.adapter.health_check():
-      runtime.breaker.record_success()
+      breaker.record_success()
     else:
+      breaker.record_failed_health_check()
       return {"outcome": "skipped_circuit_open"}
 
   runtime.limiter.wait()
-  store.mark_running(uid, witness)
   query_time = datetime.now(timezone.utc)
 
+  error: WitnessError | None = None
+  penalise = True
+  unexpected = False
+  result = None
   try:
     raw = runtime.adapter.query(original_url)
-    store_raw(output_dir, witness, uid, _raw_for_storage(raw))
     result = runtime.adapter.parse(original_url, raw)
-    runtime.breaker.record_success()
   except WitnessError as exc:
-    runtime.breaker.record_failure()
-    attempts = store.attempts(uid, witness)
-    if should_retry(exc.error_class, attempts):
-      store.mark_retry(uid, witness, exc.error_class)
-      time.sleep(min(policy_for(exc.error_class).delay(attempts), 2))
-      return {"outcome": "retried"}
-    store.mark_permanent_failure(uid, witness, exc.error_class)
-    status = (
-      _INACCESSIBLE_STATUS
-      if witness == "live_web" and exc.error_class in _LIVE_WEB_FAILURE_IS_EVIDENCE
-      else "unresolved"
+    error = exc
+  except Exception as exc:
+    _UNEXPECTED_ERRORS[0] += 1
+    logger.error(
+      "%s: unexpected error handling %s: %s: %s", witness, original_url, type(exc).__name__, exc,
+      exc_info=_UNEXPECTED_ERRORS[0] <= 20,
     )
-    return {"outcome": "permanent_failure", "observations": [{
-      "url_id": uid, "observer": witness,
-      "observation_time": query_time, "query_time": query_time,
-      "status": status, "http_status": 0,
-      "error_class": exc.error_class, "redirect_target": "",
-      "mime_type": "", "content_length": 0,
-      "content_digest": "", "response_digest": "", "confidence": 0.0,
-    }]}
+    error = WitnessError("malformed_response", f"{type(exc).__name__}: {exc}")
+    penalise = False
+    unexpected = True
 
-  now = datetime.now(timezone.utc)
-  observations = []
-  for obs in result.observations:
-    obs = {**obs, "url_id": uid}
-    obs["observation_time"] = obs["observation_time"] or now
-    obs["query_time"] = obs["query_time"] or query_time
-    observations.append(obs)
-  captures = [{**cap, "url_id": uid} for cap in result.captures]
+  if error is None:
+    raw_store.write(witness, uid, raw)
+    breaker.record_success()
+    runtime.limiter.record_success()
+    now = datetime.now(timezone.utc)
+    observations = []
+    for obs in result.observations:
+      obs = {**obs, "url_id": uid}
+      obs["observation_time"] = obs["observation_time"] or now
+      obs["query_time"] = obs["query_time"] or query_time
+      observations.append(obs)
+    captures = [{**cap, "url_id": uid} for cap in result.captures]
+    return {"outcome": "success", "observations": observations, "captures": captures,
+        "checkpoint": (SUCCESS, None)}
 
-  store.mark_success(uid, witness)
-  return {"outcome": "success", "observations": observations, "captures": captures}
+  if penalise:
+    adapter = runtime.adapter
+    if error.error_class in adapter.breaker_signals:
+      breaker.record_failure()
+    if error.error_class in adapter.limiter_signals:
+      runtime.limiter.record_failure(hard=error.error_class in adapter.hard_signals)
+  attempts = store.attempts(uid, witness) + 1
+  if should_retry(error.error_class, attempts):
+    store.mark_retry(uid, witness, error.error_class)
+    return {"outcome": "retried", "retry_after": policy_for(error.error_class).delay(attempts)}
+  status = (
+    _INACCESSIBLE_STATUS
+    if witness == "live_web" and error.error_class in _LIVE_WEB_FAILURE_IS_EVIDENCE
+    else "unresolved"
+  )
+  return {"outcome": "permanent_failure", "observations": [{
+    "url_id": uid, "observer": witness,
+    "observation_time": query_time, "query_time": query_time,
+    "status": status, "http_status": 0,
+    "error_class": error.error_class, "redirect_target": "",
+    "mime_type": "", "content_length": 0,
+    "content_digest": "", "response_digest": "", "confidence": 0.0,
+  }], "checkpoint": (PERMANENT_FAILURE, error.error_class), "unexpected": unexpected}
 
 
 def _url_shard(uid: str, num_shards: int) -> int:
@@ -1274,23 +1828,55 @@ def _stop_early_resolved(evidence: dict | None, threshold: int) -> bool:
   return bool(evidence) and (evidence["alive"] or len(evidence["inaccessible"]) >= threshold)
 
 
-def _witness_concurrency_cap(min_interval: float) -> int:
+def _witness_concurrency_cap(min_interval: float, timeout_seconds: float = 20.0) -> int:
+  settings = CONCURRENCY_SETTINGS
   rate = 1.0 / min_interval
-  return max(1, math.ceil(rate * 2))
+  latency = max(1.0, timeout_seconds * settings["assumed_latency_fraction_of_timeout"])
+  return max(2, min(settings["max_threads_per_witness"], math.ceil(rate * latency)))
+
+
+_SKIP_SLICE = 50_000
+
+
+def _load_done_bits(store: CheckpointStore, url_ids: list[str], witnesses: list[str]) -> dict[str, bytearray]:
+  size = (len(url_ids) + 7) // 8
+  bits = {w: bytearray(size) for w in witnesses}
+  for uid, w in store.done_pairs():
+    flags = bits.get(w)
+    if flags is None:
+      continue
+    i = bisect.bisect_left(url_ids, uid)
+    if i < len(url_ids) and url_ids[i] == uid:
+      flags[i >> 3] |= 1 << (i & 7)
+  return bits
+
+
+def _install_sigterm_handler():
+
+  def _handler(signum, frame):
+    raise KeyboardInterrupt
+
+  try:
+    return signal.signal(signal.SIGTERM, _handler)
+  except ValueError:
+    return None
 
 
 def run_witnesses(
   urls: list[tuple[str, str]],
   output_dir: Path,
   only_witnesses: list[str] | None = None,
-  flush_every: int = 200,
+  flush_every: int | None = None,
   max_workers: int | None = None,
   shard: int = 0,
   num_shards: int = 1,
   stop_early: bool = False,
   stop_early_threshold: int | None = None,
   report_changes: bool = False,
+  history: str = "full",
 ) -> dict:
+  flush_every = flush_every or OUTPUT_SETTINGS["flush_rows"]
+  flush_interval = OUTPUT_SETTINGS["flush_interval_seconds"]
   witness_configs = [live_witness()] + archive_witnesses()
   if only_witnesses:
     witness_configs = [w for w in witness_configs if w.name in only_witnesses]
@@ -1299,31 +1885,49 @@ def run_witnesses(
       replace(wc, requests_per_second=wc.requests_per_second / num_shards)
       for wc in witness_configs
     ]
+  witness_configs = [replace(wc, extra={**wc.extra, "history": history}) for wc in witness_configs]
   runtimes = build_runtimes(witness_configs, CIRCUIT_BREAKER_SETTINGS)
 
   if num_shards > 1:
-    urls = [(uid, u) for uid, u in urls if _url_shard(uid, num_shards) == shard]
+    urls = {uid: u for uid, u in urls.items() if _url_shard(uid, num_shards) == shard}
     ckpt_path = Path(output_dir) / "checkpoints" / f"shard-{shard:03d}-of-{num_shards:03d}.db"
+    raw_tag = f"shard-{shard:03d}"
   else:
     ckpt_path = Path(output_dir) / "checkpoints.db"
+    raw_tag = "single"
 
   store = CheckpointStore(ckpt_path)
-  url_lookup = dict(urls)
-  url_ids = list(url_lookup.keys())
+  raw_store = RawStore(output_dir, tag=raw_tag)
+  url_ids = sorted(urls)
   witness_names = list(runtimes.keys())
+  done_bits = _load_done_bits(store, url_ids, witness_names)
 
   obs_buffer: list[dict] = []
   cap_buffer: list[dict] = []
+  marks: list[tuple[str, str, str, str | None]] = []
   summary = {"queried": 0, "success": 0, "retried": 0, "permanent_failure": 0,
-       "skipped_circuit_open": 0, "skipped_early_stop": 0}
+       "skipped_circuit_open": 0, "skipped_early_stop": 0, "unexpected_errors": 0,
+       "abandoned_witnesses": 0}
+  last_flush_at = time.monotonic()
 
   def flush():
+    nonlocal last_flush_at
+    raw_store.flush()
     if obs_buffer:
       append_rows(output_dir, "observations", obs_buffer)
       obs_buffer.clear()
     if cap_buffer:
       append_rows(output_dir, "captures", cap_buffer)
       cap_buffer.clear()
+    store.mark_many(marks)
+    marks.clear()
+    last_flush_at = time.monotonic()
+
+  def flush_due(now: float) -> bool:
+    return (
+      len(obs_buffer) >= flush_every or len(cap_buffer) >= flush_every
+      or len(marks) >= flush_every or now - last_flush_at >= flush_interval
+    )
 
   threshold = stop_early_threshold if stop_early_threshold is not None else DEFAULT_CORROBORATION_THRESHOLD
   evidence_lock = threading.Lock()
@@ -1344,17 +1948,30 @@ def run_witnesses(
           ev["inaccessible"].add(w)
 
   def pending_for(w: str):
-    for uid in url_ids:
-      if store.is_done(uid, w):
+    bits = done_bits[w]
+    for i, uid in enumerate(url_ids):
+      if i % _SKIP_SLICE == _SKIP_SLICE - 1:
+        yield None
+      if bits[i >> 3] >> (i & 7) & 1:
         continue
       if _resolved(uid):
-        store.mark_skipped_early_stop(uid, w)
+        marks.append((uid, w, SKIPPED_EARLY_STOP, None))
         summary["skipped_early_stop"] += 1
         continue
       yield uid
 
   pending_iters = {w: pending_for(w) for w in witness_names}
-  caps = {w: _witness_concurrency_cap(runtimes[w].limiter.min_interval) for w in witness_names}
+  exhausted = {w: False for w in witness_names}
+  retry_heaps: dict[str, list] = {w: [] for w in witness_names}
+  inflight = {w: 0 for w in witness_names}
+  probing = {w: False for w in witness_names}
+  abandoned: set[str] = set()
+  seq = iter(range(1 << 62))
+
+  caps = {
+    w: _witness_concurrency_cap(runtimes[w].limiter.min_interval, runtimes[w].config.timeout_seconds)
+    for w in witness_names
+  }
   recommended_workers = sum(caps.values())
   if max_workers is None:
     max_workers = recommended_workers
@@ -1370,6 +1987,11 @@ def run_witnesses(
       "their allowance. Raise --workers to >= %d for full throughput.",
       len(witness_names), recommended_workers, max_workers, recommended_workers,
     )
+  if max_workers > CONCURRENCY_SETTINGS["warn_total_threads"]:
+    logging.getLogger(__name__).warning(
+      "run: %d worker threads in a single process is a lot; consider --shard i/n to "
+      "spread the work over several processes.", max_workers,
+    )
 
   total_tasks = len(url_ids) * len(witness_names)
   tty = sys.stdout.isatty()
@@ -1377,62 +1999,192 @@ def run_witnesses(
   start_time = time.monotonic()
   last_progress_at = start_time
   completed = 0
+  done_by_witness = {w: 0 for w in witness_names}
+  succeeded_by_witness = {w: 0 for w in witness_names}
+  stats_interval = 300.0
+  last_stats_at = start_time
   UI._progress_lines = 0
 
-  with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    in_flight: dict = {}
+  executor = ThreadPoolExecutor(max_workers=max_workers)
+  done_q: queue.SimpleQueue = queue.SimpleQueue()
+  in_flight: dict = {}
 
-    def submit_for(w: str) -> bool:
-      for uid in pending_iters[w]:
-        fut = executor.submit(
-          _process_unit, uid, w, url_lookup[uid], runtimes[w], output_dir, store,
+  def next_uid(w: str):
+    heap = retry_heaps[w]
+    if heap and heap[0][0] <= time.monotonic():
+      return heapq.heappop(heap)[2]
+    if exhausted[w]:
+      return None
+    try:
+      uid = next(pending_iters[w])
+    except StopIteration:
+      exhausted[w] = True
+      return None
+    return uid if uid is not None else ""
+
+  def submit(w: str, uid: str, probe: bool) -> None:
+    fut = executor.submit(_process_unit, uid, w, urls[uid], runtimes[w], raw_store, store)
+    in_flight[fut] = (w, uid, probe)
+    inflight[w] += 1
+    if probe:
+      probing[w] = True
+    fut.add_done_callback(done_q.put)
+
+  def fill(w: str) -> None:
+    if w in abandoned:
+      return
+    breaker = runtimes[w].breaker
+    while inflight[w] < caps[w]:
+      never_reached = (
+        breaker.is_open and succeeded_by_witness[w] == 0
+        and breaker.failed_health_checks >= breaker.max_failed_health_checks_before_first_success
+      )
+      if breaker.given_up or never_reached:
+        abandoned.add(w)
+        logger.warning(
+          "%s: circuit breaker stayed open through %d failed health checks%s; its remaining "
+          "URLs are left for the next run.", w, breaker.failed_health_checks,
+          " without a single successful request" if never_reached else "",
         )
-        in_flight[fut] = (w, uid)
-        return True
-      return False
+        return
+      probe = breaker.is_open
+      if probe and (probing[w] or not breaker.ready_for_health_check()):
+        return
+      uid = next_uid(w)
+      if not uid:
+        return
+      submit(w, uid, probe)
+      if probe:
+        return
 
+  def work_remaining() -> bool:
+    return any(
+      w not in abandoned and (retry_heaps[w] or not exhausted[w]) for w in witness_names
+    )
+
+  def waiting_on() -> list[str]:
+    out = []
     for w in witness_names:
-      for _ in range(caps[w]):
-        if not submit_for(w):
+      if w in abandoned or inflight[w] or not (retry_heaps[w] or not exhausted[w]):
+        continue
+      breaker = runtimes[w].breaker
+      if breaker.is_open:
+        out.append(f"{w} (unreachable; next check in {breaker.seconds_until_health_check:,.0f}s)")
+      elif retry_heaps[w]:
+        out.append(f"{w} (retrying after a failure)")
+    return out
+
+  def handle(fut) -> str:
+    nonlocal completed
+    w, uid, probe = in_flight.pop(fut)
+    inflight[w] -= 1
+    if probe:
+      probing[w] = False
+    result = fut.result()
+    outcome = result["outcome"]
+    if outcome != "skipped_circuit_open":
+      summary["queried"] += 1
+    summary[outcome] += 1
+    if outcome == "skipped_circuit_open":
+      heapq.heappush(retry_heaps[w], (time.monotonic(), next(seq), uid))
+      return w
+    if outcome == "retried":
+      heapq.heappush(retry_heaps[w], (time.monotonic() + result["retry_after"], next(seq), uid))
+      return w
+    completed += 1
+    done_by_witness[w] += 1
+    if outcome == "success":
+      succeeded_by_witness[w] += 1
+    if result.get("unexpected"):
+      summary["unexpected_errors"] += 1
+    marks.append((uid, w, *result["checkpoint"]))
+    obs_buffer.extend(result.get("observations", []))
+    cap_buffer.extend(result.get("captures", []))
+    _record_evidence(uid, w, result.get("observations", []))
+    if report_changes:
+      transitions = _witness_digest_transitions(
+        result.get("observations", []), result.get("captures", []),
+      )
+      if transitions:
+        latest = max(transitions, key=lambda t: t["first_new_time"])
+        UI._progress_lines = 0
+        UI.log("info", f"{urls[uid]} -- {len(transitions)} content "
+                f"change(s) seen by {latest['witness']}, most recent "
+                f"{latest['first_new_time']:%Y-%m-%d %H:%M} UTC")
+    return w
+
+  previous_sigterm = _install_sigterm_handler()
+  _SHUTDOWN.clear()
+  finished = False
+  try:
+    for w in witness_names:
+      fill(w)
+    last_tick = time.monotonic()
+    while True:
+      batch = []
+      try:
+        batch.append(done_q.get(timeout=1.0))
+      except queue.Empty:
+        pass
+      while True:
+        try:
+          batch.append(done_q.get_nowait())
+        except queue.Empty:
           break
-
-    while in_flight:
-      done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
-      for fut in done:
-        w, uid = in_flight.pop(fut)
-        result = fut.result()
-        outcome = result["outcome"]
-        if outcome != "skipped_circuit_open":
-          summary["queried"] += 1
-        summary[outcome] += 1
-        completed += 1
-        obs_buffer.extend(result.get("observations", []))
-        cap_buffer.extend(result.get("captures", []))
-        _record_evidence(uid, w, result.get("observations", []))
-        if len(obs_buffer) >= flush_every or len(cap_buffer) >= flush_every:
-          flush()
-
-        if report_changes:
-          transitions = _witness_digest_transitions(
-            result.get("observations", []), result.get("captures", []),
-          )
-          if transitions:
-            latest = max(transitions, key=lambda t: t["first_new_time"])
-            UI._progress_lines = 0
-            UI.log("info", f"{url_lookup[uid]} -- {len(transitions)} content "
-                    f"change(s) seen by {latest['witness']}, most recent "
-                    f"{latest['first_new_time']:%Y-%m-%d %H:%M} UTC")
-
-        submit_for(w)
-
+      touched = {handle(fut) for fut in batch}
       now = time.monotonic()
+      if now - last_tick >= 1.0:
+        touched = set(witness_names)
+        last_tick = now
+      for w in touched:
+        fill(w)
+
+      if flush_due(now):
+        flush()
+
       if now - last_progress_at >= progress_interval:
-        UI.progress(summary, completed, total_tasks, start_time, tty)
+        UI.progress(summary, completed + summary["skipped_early_stop"], total_tasks, start_time, tty,
+                    waiting=waiting_on())
         last_progress_at = now
 
-  UI.progress(summary, completed, total_tasks, start_time, tty, final=True)
-  flush()
-  store.close()
+      if now - last_stats_at >= stats_interval:
+        last_stats_at = now
+        for w in witness_names:
+          rt = runtimes[w]
+          logger.info(
+            "%s: %.2f req/s now (configured %.2f), %d in flight, %d done, breaker %s",
+            w, rt.limiter.current_rps, rt.config.requests_per_second, inflight[w],
+            done_by_witness[w], "open" if rt.breaker.is_open else "closed",
+          )
+
+      if not in_flight and not work_remaining():
+        break
+    finished = True
+  finally:
+    if not finished:
+      _SHUTDOWN.set()
+    try:
+      flush()
+    finally:
+      executor.shutdown(wait=finished, cancel_futures=True)
+      if previous_sigterm is not None:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+      raw_store.close()
+      store.close()
+
+  summary["abandoned_witnesses"] = len(abandoned)
+  UI.progress(summary, completed + summary["skipped_early_stop"], total_tasks, start_time, tty, final=True)
+  if abandoned:
+    UI.log("issue", f"Left for the next run (never reachable): {', '.join(sorted(abandoned))}")
+  unreliable = sorted(
+    w for w, rt in runtimes.items()
+    if isinstance(rt.adapter, WebArchiveAdapter) and rt.adapter.latest_unreliable()
+  )
+  if unreliable:
+    logger.warning("latest-capture dates look unreliable for: %s", ", ".join(unreliable))
+    UI.log("issue", f"{', '.join(unreliable)}: the latest-capture query always returned the earliest "
+                    f"capture, so this archive probably ignores sort=reverse and its latest dates can't be trusted "
+                    f"(use --changes to fetch full histories instead)")
   return summary
 
 
@@ -1440,7 +2192,6 @@ def run_witnesses(
 
 S0_ALIVE = "S0"
 S1_CONTENT_CHANGED = "S1"
-S2_URL_SURVIVES_CONTENT_GONE = "S2"
 S3_STRONG_DISAPPEARANCE = "S3"
 S4_UNRESOLVED = "S4"
 
@@ -1523,39 +2274,6 @@ def _content_survival(observations: list[dict], captures: list[dict]) -> str:
   return "unknown"
 
 
-def _content_trajectory(observations: list[dict], captures: list[dict]) -> str | None:
-
-  def _from_series(triples: list[tuple]) -> str | None:
-    with_length = sorted((t, ln) for t, _, ln in triples if ln is not None and ln > 0)
-    if len(with_length) < 2:
-      return None
-    first_len, last_len = with_length[0][1], with_length[-1][1]
-    ratio = min(first_len, last_len) / max(first_len, last_len)
-    return "replaced" if ratio < CONTENT_REPLACEMENT_LENGTH_RATIO else "edited"
-
-  live = [
-    (o["observation_time"], o["content_digest"], o.get("content_length"))
-    for o in observations if o.get("observer") == "live_web" and o.get("content_digest")
-  ]
-  if len({d for _, d, _ in live}) > 1:
-    result = _from_series(live)
-    if result:
-      return result
-
-  by_archive: dict[str, list] = {}
-  for c in captures:
-    if c.get("digest"):
-      by_archive.setdefault(c["archive"], []).append(
-        (c["capture_time"], c["digest"], c.get("content_length"))
-      )
-  for series in by_archive.values():
-    if len({d for _, d, _ in series}) > 1:
-      result = _from_series(series)
-      if result:
-        return result
-  return None
-
-
 def _witness_digest_transitions(observations: list[dict], captures: list[dict]) -> list[dict]:
   series_by_witness: dict[str, list[tuple]] = {}
 
@@ -1586,20 +2304,15 @@ def classify_resource_state(
   captures: list[dict],
   corroboration_threshold: int = DEFAULT_CORROBORATION_THRESHOLD,
   established_by_archive: dict[str, int] | None = None,
+  with_changes: bool = True,
 ) -> dict:
   latest_obs = _latest_by(observations, "observer", "observation_time")
   alive = any(o["status"] == _ALIVE_STATUS for o in latest_obs.values())
   inaccessible = _inaccessible_witnesses(observations, captures, established_by_archive)
-  content_survival = _content_survival(observations, captures)
+  content_survival = _content_survival(observations, captures) if with_changes else "unknown"
 
   if alive:
-    trajectory = _content_trajectory(observations, captures) if content_survival == "changed" else None
-    if trajectory == "edited":
-      state = S1_CONTENT_CHANGED
-    elif trajectory == "replaced":
-      state = S2_URL_SURVIVES_CONTENT_GONE
-    else:
-      state = S0_ALIVE
+    state = S1_CONTENT_CHANGED if content_survival == "changed" else S0_ALIVE
   elif len(inaccessible) >= corroboration_threshold:
     state = S3_STRONG_DISAPPEARANCE
   else:
@@ -1622,7 +2335,7 @@ def archival_risk(
   resource_state: dict,
   established_by_archive: dict[str, int] | None = None,
 ) -> dict:
-  ever_existed = resource_state["state"] in ("S0", "S1", "S2", "S3")
+  ever_existed = resource_state["state"] in ("S0", "S1", "S3")
   preserved = resource_state["preserved"]
   latest_obs = _latest_by(observations, "observer", "observation_time")
   alive = any(o["status"] == _ALIVE_STATUS for o in latest_obs.values())
@@ -1636,75 +2349,146 @@ def archival_risk(
   }
 
 
-def _read_table(con: duckdb.DuckDBPyConnection, glob: str) -> pd.DataFrame:
+_OBS_COLUMNS = ("url_id", "observer", "observation_time", "status", "content_digest", "content_length")
+_OBS_ORDER = "url_id, observer, observation_time, status, content_digest"
+_CAP_COLUMNS = ("url_id", "archive", "capture_time", "status", "digest", "content_length")
+_CAP_ORDER = "url_id, archive, capture_time, status, digest"
+_STREAM_BATCH_ROWS = 100_000
+_EVENT_CHUNK_ROWS = 500_000
+
+
+def _stream_by_url(cur: duckdb.DuckDBPyConnection, glob: str, columns: tuple[str, ...], order: str):
+  query = f"SELECT {', '.join(columns)} FROM read_parquet('{glob}') ORDER BY {order}"
   try:
-    return con.execute(f"SELECT * FROM read_parquet('{glob}')").fetchdf()
+    reader = _batches(cur.execute(query), _STREAM_BATCH_ROWS)
   except duckdb.IOException:
-    return pd.DataFrame()
+    return
+  current: str | None = None
+  rows: list[dict] = []
+  for batch in reader:
+    for row in batch.to_pylist():
+      uid = row["url_id"]
+      if uid != current:
+        if current is not None:
+          yield current, rows
+        current, rows = uid, []
+      rows.append(row)
+  if current is not None:
+    yield current, rows
 
 
-def _group_by_url(df: pd.DataFrame) -> dict[str, list[dict]]:
-  return {} if df.empty else {uid: g.to_dict("records") for uid, g in df.groupby("url_id")}
+def _merge_by_url(obs_stream, cap_stream):
+  obs = next(obs_stream, None)
+  cap = next(cap_stream, None)
+  while obs is not None or cap is not None:
+    uid = min(item[0] for item in (obs, cap) if item is not None)
+    observations: list[dict] = []
+    captures: list[dict] = []
+    if obs is not None and obs[0] == uid:
+      observations = obs[1]
+      obs = next(obs_stream, None)
+    if cap is not None and cap[0] == uid:
+      captures = cap[1]
+      cap = next(cap_stream, None)
+    yield uid, observations, captures
+
+
+def _events_for_url(
+  uid: str,
+  observations: list[dict],
+  captures: list[dict],
+  corroboration_threshold: int,
+  established_by_archive: dict[str, int] | None,
+  with_changes: bool = True,
+) -> list[dict]:
+  state = classify_resource_state(observations, captures, corroboration_threshold, established_by_archive, with_changes)
+  risk = archival_risk(observations, captures, state, established_by_archive)
+
+  times = [t for t in (
+    [o["observation_time"] for o in observations] + [c["capture_time"] for c in captures]
+  ) if t is not None]
+  event_start, event_end = (min(times), max(times)) if times else (None, None)
+  base = {
+    "url_id": uid, "event_start": event_start, "event_end": event_end,
+    "evidence_count": state["evidence_count"], "witness_count": state["witness_count"],
+    "archive": None,
+  }
+  events = [{**base, "event_type": f"state_{state['state']}",
+        "confidence": 1.0 if state["state"] != "S4" else 0.5}]
+  events.extend(
+    {**base, "event_type": f"risk_{name}", "confidence": 1.0}
+    for name, flagged in risk.items() if flagged
+  )
+
+  transitions = _witness_digest_transitions(observations, captures) if with_changes else []
+  if transitions:
+    by_witness: dict[str, list[dict]] = {}
+    for tr in transitions:
+      by_witness.setdefault(tr["witness"], []).append(tr)
+    events.extend(
+      {
+        "url_id": uid, "event_type": "content_changed",
+        "event_start": min(t["last_old_time"] for t in tr_list),
+        "event_end": max(t["first_new_time"] for t in tr_list),
+        "confidence": 1.0, "evidence_count": len(tr_list), "witness_count": 1,
+        "archive": witness,
+      }
+      for witness, tr_list in by_witness.items()
+    )
+  elif state["content_survival"] == "stable":
+    events.append({**base, "event_type": "content_stable", "confidence": 1.0})
+  return events
 
 
 def classify_all(
   output_dir: Path,
   corroboration_threshold: int = DEFAULT_CORROBORATION_THRESHOLD,
   established_by_archive: dict[str, int] | None = None,
+  with_changes: bool = True,
 ) -> int:
+  events_dir = table_dir(output_dir, "events")
+  for stale in events_dir.glob("*.staged"):
+    stale.unlink()
+
+  tmp_dir = Path(output_dir) / ".duckdb_tmp"
+  tmp_dir.mkdir(parents=True, exist_ok=True)
   con = duckdb.connect()
-  obs_by_url = _group_by_url(_read_table(con, str(table_dir(output_dir, "observations") / "*.parquet")))
-  cap_by_url = _group_by_url(_read_table(con, str(table_dir(output_dir, "captures") / "*.parquet")))
-  url_ids = set(obs_by_url) | set(cap_by_url)
-  if not url_ids:
+  con.execute(f"SET temp_directory='{tmp_dir}'")
+  con.execute("SET preserve_insertion_order=false")
+
+  obs_stream = _stream_by_url(
+    con.cursor(), str(table_dir(output_dir, "observations") / "*.parquet"), _OBS_COLUMNS, _OBS_ORDER)
+  cap_stream = _stream_by_url(
+    con.cursor(), str(table_dir(output_dir, "captures") / "*.parquet"), _CAP_COLUMNS, _CAP_ORDER)
+
+  staged: list[Path] = []
+  events: list[dict] = []
+  classified = 0
+
+  def stage_chunk() -> None:
+    path = events_dir / f"part-{uuid.uuid4().hex}.parquet.staged"
+    pq.write_table(pa.Table.from_pylist(events, schema=TABLES["events"]), path)
+    staged.append(path)
+    events.clear()
+
+  for uid, observations, captures in _merge_by_url(obs_stream, cap_stream):
+    classified += 1
+    events.extend(_events_for_url(
+      uid, observations, captures, corroboration_threshold, established_by_archive, with_changes,
+    ))
+    if len(events) >= _EVENT_CHUNK_ROWS:
+      stage_chunk()
+  if events:
+    stage_chunk()
+
+  if classified == 0:
     return 0
 
-  for old_part in table_dir(output_dir, "events").glob("*.parquet"):
+  for old_part in events_dir.glob("*.parquet"):
     old_part.unlink()
-
-  events = []
-  for uid in url_ids:
-    observations = obs_by_url.get(uid, [])
-    captures = cap_by_url.get(uid, [])
-    state = classify_resource_state(observations, captures, corroboration_threshold, established_by_archive)
-    risk = archival_risk(observations, captures, state, established_by_archive)
-
-    times = [t for t in (
-      [o["observation_time"] for o in observations] + [c["capture_time"] for c in captures]
-    ) if t is not None]
-    event_start, event_end = (min(times), max(times)) if times else (None, None)
-    base = {
-      "url_id": uid, "event_start": event_start, "event_end": event_end,
-      "evidence_count": state["evidence_count"], "witness_count": state["witness_count"],
-      "archive": None,
-    }
-    events.append({**base, "event_type": f"state_{state['state']}",
-            "confidence": 1.0 if state["state"] != "S4" else 0.5})
-    events.extend(
-      {**base, "event_type": f"risk_{name}", "confidence": 1.0}
-      for name, flagged in risk.items() if flagged
-    )
-
-    transitions = _witness_digest_transitions(observations, captures)
-    if transitions:
-      by_witness: dict[str, list[dict]] = {}
-      for tr in transitions:
-        by_witness.setdefault(tr["witness"], []).append(tr)
-      events.extend(
-        {
-          "url_id": uid, "event_type": "content_changed",
-          "event_start": min(t["last_old_time"] for t in tr_list),
-          "event_end": max(t["first_new_time"] for t in tr_list),
-          "confidence": 1.0, "evidence_count": len(tr_list), "witness_count": 1,
-          "archive": witness,
-        }
-        for witness, tr_list in by_witness.items()
-      )
-    elif state["content_survival"] == "stable":
-      events.append({**base, "event_type": "content_stable", "confidence": 1.0})
-
-  append_rows(output_dir, "events", events)
-  return len(url_ids)
+  for path in staged:
+    os.replace(path, path.with_suffix(""))
+  return classified
 
 
 # ------------------- Stage 4 -------------------
@@ -1819,7 +2603,7 @@ def summarize_urls(
   established_by_archive: dict[str, int] | None = None,
 ) -> tuple[Path, int]:
   if not has_rows(output_dir, "urls"):
-    raise RuntimeError("No data to summarize -- run `pluto.py sample` first.")
+    raise UIError("No data to summarize -- run `python pluto.py run` first.")
 
   out_path = Path(out_path) if out_path else Path(output_dir) / "summary.parquet"
   query = _SUMMARY_QUERY.format(
@@ -1838,8 +2622,8 @@ def summarize_urls(
 # ------------------- CLI -------------------
 
 
-def _plural(n: int, word: str) -> str:
-  return word if n == 1 else f"{word}s"
+def _plural(n: int, word: str, plural: str | None = None) -> str:
+  return word if n == 1 else (plural or f"{word}s")
 
 
 class UI:
@@ -1881,13 +2665,18 @@ class UI:
       print(f"{indent}{connector} {line}")
 
   @staticmethod
+  def leaf(text, last=False, indent=" "):
+    connector = "└─" if last else "├─"
+    print(f"{indent}{connector} {text}")
+
+  @staticmethod
   def line():
     print()
 
   _progress_lines = 0
 
   @classmethod
-  def progress(cls, summary, done, total, start, tty, final=False):
+  def progress(cls, summary, done, total, start, tty, final=False, waiting=None):
     elapsed = max(time.monotonic() - start, 1e-9)
     rate = done / elapsed
     pct = (done / total * 100) if total else 100.0
@@ -1898,127 +2687,182 @@ class UI:
     counts_line = (f"Success: {summary['success']:,} · Retried: {summary['retried']:,} · "
            f"Failed: {summary['permanent_failure']:,} · Skipped: {skipped:,}")
     rates_line = f"Elapsed: {elapsed:,.0f}s · Pace: {rate:.1f}/s"
-    if not final and eta:
+    if not final and eta and not waiting:
       rates_line += f" · Eta: {eta:,.0f}s"
 
-    block = [f" ├─ {progress_line}", f" ├─ {counts_line}", f" └─ {rates_line}"]
+    block = [f" ├─ {progress_line}", f" ├─ {counts_line}"]
+    if waiting and not final:
+      shown = ", ".join(waiting[:3]) + (f" and {len(waiting) - 3} more" if len(waiting) > 3 else "")
+      block.append(f" ├─ Waiting on: {shown}")
+    block.append(f" └─ {rates_line}")
 
     if tty:
       if cls._progress_lines:
         print(f"\033[{cls._progress_lines}A", end="")
       for line in block:
         print(f"\033[2K{line}")
+      extra = max(0, cls._progress_lines - len(block))
+      if extra:
+        for _ in range(extra):
+          print("\033[2K")
+        print(f"\033[{extra}A", end="")
       cls._progress_lines = 0 if final else len(block)
     else:
       for line in block:
         print(line)
 
 
-class UIError(click.ClickException):
-
-  def show(self, file=None) -> None:
-    UI.log("error", self.format_message())
+class UIError(Exception):
+  pass
 
 
-class OrderedGroup(click.Group):
-  ORDER = ["fetch-archives", "list-archives", "sample", "run", "classify", "summarize", "export", "status"]
+def _load_urls(
+  output_dir: Path, limit: int | None, shard: int, num_shards: int,
+) -> tuple[dict[str, str], int]:
+  glob = str(table_dir(output_dir, "urls") / "*.parquet")
+  con = duckdb.connect()
+  try:
+    reader = _batches(con.execute(f"SELECT url_id, original_url FROM read_parquet('{glob}')"), 100_000)
+  except duckdb.IOException:
+    return {}, 0
+  urls: dict[str, str] = {}
+  total = 0
+  for batch in reader:
+    ids = batch.column("url_id").to_pylist()
+    originals = batch.column("original_url").to_pylist()
+    for uid, original in zip(ids, originals):
+      total += 1
+      if num_shards <= 1 or _url_shard(uid, num_shards) == shard:
+        urls[uid] = original
+      if limit and total >= limit:
+        return urls, total
+  return urls, total
 
-  def list_commands(self, ctx):
-    order = {name: i for i, name in enumerate(self.ORDER)}
-    return sorted(self.commands, key=lambda name: order.get(name, len(order)))
+
+def _prepare_urls(output_dir: Path, input_values, scope_spec: str | None, only_witnesses: str | None) -> None:
+  input_values = list(input_values)
+  domain_values = [v for v in input_values if not Path(v).exists()]
+  path_values = [Path(v) for v in input_values if Path(v).exists()]
+
+  if scope_spec and not domain_values:
+    raise UIError("--scope only does something when --input includes a "
+            "domain (not just files/folders).")
+  scope = _parse_scope(scope_spec or "all") if domain_values else None
+
+  discover_archives = None
+  if only_witnesses:
+    discover_archives = [w[len("archive:"):] if w.startswith("archive:") else w
+                for w in only_witnesses.split(",") if w.strip() and w.strip() != "live_web"]
+
+  if not has_rows(output_dir, "urls"):
+    if not input_values:
+      paths = _default_candidates()
+      if not paths:
+        raise UIError(
+          f"No URLs picked yet, and no input found. Put a URL list (.csv or .gz) "
+          f"in {INPUT_DIR} -- or point --input at a file/folder, or domain."
+        )
+      _pick_from_files(output_dir, paths)
+    else:
+      if path_values:
+        _pick_from_files(output_dir, _resolve_candidate_paths(path_values))
+      for d in domain_values:
+        rows = discover_candidates(d, scope=scope, only_archives=discover_archives)
+        if not rows:
+          raise UIError(f"No captures found for {d} across the queried archives.")
+        _, added, skipped = write_urls_table(output_dir, rows)
+        UI.log("ok", f"{added:,} {_plural(added, 'URL')} picked from {d}"
+               f"{f' ({skipped:,} already tracked)' if skipped else ''}")
 
 
-@click.group(cls=OrderedGroup)
-@click.option("--output-dir", type=click.Path(path_type=Path), default=OUTPUT_DIR,
-       help="Root directory for parquet tables, raw responses and checkpoints.")
-@click.option("-v", "--verbose", is_flag=True, help="Enable INFO-level logging.")
-@click.pass_context
-def cli(ctx, output_dir: Path, verbose: bool):
+def _pick_from_files(output_dir: Path, paths: list[Path]) -> None:
+  names = ", ".join(Path(p).name for p in paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+  UI.log("info", f"Picking URLs from {names}...")
+  _, added, skipped = sample_from_files(output_dir, paths, show_progress=False)
+  UI.log("ok", f"{added:,} {_plural(added, 'URL')} picked"
+         f"{f' ({skipped:,} duplicates skipped)' if skipped else ''}")
+
+
+_URLS_LOCK_STALE_SECONDS = 3600
+
+
+def _urls_last_activity(output_dir: Path, lock: Path) -> float:
+  newest = 0.0
+  for path in [lock, *table_dir(output_dir, "urls").glob("*")]:
+    try:
+      newest = max(newest, path.stat().st_mtime)
+    except OSError:
+      pass
+  return newest
+
+
+def _ensure_urls(output_dir: Path, input_values, scope_spec: str | None, only_witnesses: str | None) -> bool:
   output_dir = Path(output_dir)
-  output_dir.mkdir(parents=True, exist_ok=True)
-  handlers: list[logging.Handler] = [logging.FileHandler(output_dir / "pluto.log")]
-  if verbose:
-    handlers.append(logging.StreamHandler())
-  logging.basicConfig(level=logging.INFO, handlers=handlers,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-  ctx.ensure_object(dict)
-  ctx.obj["output_dir"] = output_dir
-  init_tables(output_dir)
+  ready = output_dir / "urls.ready"
+  lock = output_dir / "urls.building"
+  waited = False
+  built = False
+  while not ready.exists():
+    try:
+      fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+      if not waited:
+        UI.log("info", "Another job is picking the URLs; waiting for it to finish...")
+        waited = True
+      if time.time() - _urls_last_activity(output_dir, lock) > _URLS_LOCK_STALE_SECONDS:
+        try:
+          os.replace(lock, output_dir / f"urls.building.stale-{os.getpid()}")
+        except OSError:
+          pass
+      time.sleep(2)
+      continue
+    os.close(fd)
+    try:
+      if not ready.exists():
+        was_empty = not has_rows(output_dir, "urls")
+        _prepare_urls(output_dir, input_values, scope_spec, only_witnesses)
+        built = built or was_empty
+        if not has_rows(output_dir, "urls"):
+          raise UIError("No URLs found. Point --input at a file/folder, or domain.")
+        ready.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    finally:
+      try:
+        os.remove(lock)
+      except OSError:
+        pass
+  return built or waited
 
 
-@cli.command(short_help="Pick a random sample of URLs from your input files into the study.")
-@click.option("--candidates", "candidates_paths", type=click.Path(exists=True, path_type=Path), multiple=True,
-       help="Input files or a folder to pick from: Garg et al.'s *_firstcdx.gz files, "
-         "or a .csv with columns url[, first_observed_year]. Default: auto-detect "
-         f"from {INPUT_DIR} (looks for {GARG_DIR}/, then {DEFAULT_CANDIDATES_PATH}, "
-         f"then any .csv/.gz directly in {INPUT_DIR}).")
-@click.option("--n", "n", type=int, default=None,
-       help="Only check N URLs (random sample across all input files). Omit for every candidate.")
-@click.pass_context
-def sample(ctx, candidates_paths: tuple[Path, ...], n: int | None):
-  paths = _resolve_candidate_paths(list(candidates_paths)) if candidates_paths else _default_candidates()
-  if not paths:
-    raise UIError(
-      f"No input found. Put Garg et al.'s *_firstcdx.gz files (in {GARG_DIR}/), or a "
-      f"candidates.csv, in {INPUT_DIR} -- or point --candidates at a file or folder."
-    )
-  UI.line()
-  UI.log("info", f"Sampling from input {_plural(len(paths), 'file')}...")
-  path, added, skipped = sample_from_files(ctx.obj["output_dir"], paths, n=n, show_progress=False)
-  if added == 0 and skipped == 0:
-    raise UIError(f"No candidate rows found in {', '.join(str(p) for p in paths)}")
-  if skipped:
-    UI.log("ok", f"Added {added} new {_plural(added, 'URL')} ({skipped} already in the study, skipped)")
-  else:
-    UI.log("ok", f"Added {added} {_plural(added, 'URL')} to {path}")
-  UI.line()
+def _read_history(output_dir: Path) -> str | None:
+  path = Path(output_dir) / "history.json"
+  try:
+    return json.loads(path.read_text(encoding="utf-8")).get("history")
+  except (OSError, ValueError):
+    return "full" if has_rows(output_dir, "captures") or has_rows(output_dir, "observations") else None
 
 
-@cli.command(short_help="Query the live web and every archive for each URL in the study.")
-@click.option("--candidates", "candidates_paths", type=click.Path(exists=True, path_type=Path), multiple=True,
-       help="Input files or a folder to pick target URLs from, if none have been "
-         "picked yet -- same as `sample --candidates`. Default: auto-detect from "
-         f"{INPUT_DIR}. Ignored once URLs already exist; use `pluto.py sample` "
-         "directly to add more later.")
-@click.option("--witnesses", "only_witnesses", default=None,
-       help="Comma-separated witnesses, e.g. 'live_web,ia,cc' (archive ids auto-expand "
-         "to 'archive:<id>'). Default: every enabled witness.")
-@click.option("--limit", type=int, default=None, help="Only query the first N URLs.")
-@click.option("--workers", type=int, default=None,
-       help="Concurrent worker threads; each witness gets its own share so a fast "
-         "one (live_web) isn't held to a slow archive's pace. Default: auto-sized "
-         "to exactly cover every enabled witness's own configured rate (startup "
-         "logs the number chosen).")
-@click.option("--shard", type=int, default=None,
-       help="This process's shard index (HPC job arrays); auto-detected from "
-         "SLURM_ARRAY_TASK_ID or SGE_TASK_ID (Eddie, most UK clusters) unless "
-         "given explicitly. Default: 0 (no sharding).")
-@click.option("--num-shards", type=int, default=None,
-       help="Total shard count; auto-detected alongside --shard for SLURM and Grid "
-         "Engine. PBS and LSF need this explicit, since neither exposes array "
-         "size. Default: 1 (no sharding). Splits URLs across shards, but each "
-         "witness's own configured rate is shared across all shards, not "
-         "multiplied by shard count -- more shards means faster iteration over "
-         "URLs, not a higher hit rate against any one witness.")
-@click.option("--stop-early", is_flag=True, default=False,
-       help="Once a URL's evidence already makes its state certain (any witness "
-         "alive, or --stop-early-threshold independent witnesses inaccessible), "
-         "skip its remaining witnesses. Trades evidence completeness for speed -- "
-         "see run_witnesses()'s docstring for the caveat around Section 4.3's "
-         "independence filter. Off by default.")
-@click.option("--stop-early-threshold", type=int, default=None,
-       help=f"Independent inaccessible witnesses needed to stop early (default: "
-         f"{DEFAULT_CORROBORATION_THRESHOLD}, matching `classify`'s own default -- "
-         f"set it higher than your intended --corroboration-threshold as a margin "
-         f"against captures later excluded by the independence filter).")
-@click.option("--report-changes", is_flag=True, default=False,
-       help="Print a line to the terminal whenever a witness's own capture history "
-         "shows the content changed, with the archive ID and the datetimes bounding "
-         "the change. Handy on a small exploratory run; noisy at HPC scale -- classify "
-         "always records every change to the events table regardless of this flag.")
-@click.pass_context
-def run(ctx, candidates_paths, only_witnesses, limit, workers, shard, num_shards,
-    stop_early, stop_early_threshold, report_changes):
+def _claim_history(output_dir: Path, wanted: str) -> None:
+  existing = _read_history(output_dir)
+  if existing is not None and existing != wanted:
+    have = "full histories (--changes)" if existing == "full" else "first and last captures only"
+    fix = "add --changes to continue it" if existing == "full" else "drop --changes to continue it"
+    raise UIError(f"This output folder already holds {have}; {fix}, or use a new --output.")
+  path = Path(output_dir) / "history.json"
+  tmp = path.with_name(f"history.json.{os.getpid()}.tmp")
+  tmp.write_text(json.dumps({"history": wanted}), encoding="utf-8")
+  os.replace(tmp, path)
+
+
+def _parse_shard(spec: str | None) -> tuple[int, int]:
+  shard = num_shards = None
+  if spec:
+    parts = spec.split("/")
+    if len(parts) not in (1, 2):
+      raise UIError(f"--shard must be 'i' or 'i/n' -- got {spec!r}.")
+    shard = _safe_int(parts[0])
+    num_shards = _safe_int(parts[1]) if len(parts) == 2 else None
+    if shard is None or (len(parts) == 2 and num_shards is None):
+      raise UIError(f"--shard must be 'i' or 'i/n' with integers -- got {spec!r}.")
   if shard is None or num_shards is None:
     detected = _hpc_shard_from_env()
     if detected:
@@ -2030,116 +2874,100 @@ def run(ctx, candidates_paths, only_witnesses, limit, workers, shard, num_shards
           raise UIError(
             f"Detected a {scheduler} job array (task index {det_shard}) but "
             f"{scheduler} doesn't expose the array's total size as an "
-            f"environment variable -- pass --num-shards explicitly."
+            f"environment variable -- pass --shard {det_shard}/<n> explicitly."
           )
         num_shards = det_count
   shard = 0 if shard is None else shard
   num_shards = 1 if num_shards is None else num_shards
   if not (0 <= shard < num_shards):
     raise UIError(
-      f"--shard must be in [0, {num_shards}) -- got {shard}. If this came from a job "
-      f"array, check its index range starts at 0, or pass --shard/--num-shards explicitly."
+      f"--shard index must be in [0, {num_shards}) -- got {shard}. If this came from "
+      f"a job array, check its index range starts at 0, or pass --shard i/n explicitly."
     )
+  return shard, num_shards
 
-  output_dir = ctx.obj["output_dir"]
 
-  if not has_rows(output_dir, "urls"):
-    paths = _resolve_candidate_paths(list(candidates_paths)) if candidates_paths else _default_candidates()
-    if not paths:
-      raise UIError(
-        f"No URLs picked yet, and no input found. Put Garg et al.'s *_firstcdx.gz "
-        f"files (in {GARG_DIR}/), or a candidates.csv, in {INPUT_DIR} -- or point "
-        f"--candidates at a file or folder."
-      )
-    sample_from_files(output_dir, paths, show_progress=False)
+def _witness_names(spec: str | None) -> list[str] | None:
+  if not spec:
+    return None
+  return [n if n == "live_web" or n.startswith("archive:") else f"archive:{n}" for n in spec.split(",")]
 
-  urls_glob = str(table_dir(output_dir, "urls") / "*.parquet")
-  con = duckdb.connect()
-  try:
-    df = con.execute(f"SELECT DISTINCT url_id, original_url FROM read_parquet('{urls_glob}')").fetchdf()
-  except duckdb.IOException:
-    raise UIError("No URLs found — run `pluto.py sample` first.")
-  if limit:
-    df = df.head(limit)
-  if df.empty:
-    raise UIError("No URLs found — run `pluto.py sample` first.")
 
-  only = None
-  if only_witnesses:
-    only = [n if n == "live_web" or n.startswith("archive:") else f"archive:{n}"
-        for n in only_witnesses.split(",")]
+def cmd_run(args) -> None:
+  if args.report_changes and not args.changes:
+    raise UIError("--report-changes needs --changes (it reads each archive's full history).")
+  shard, num_shards = _parse_shard(args.shard)
 
+  output_dir = args.output_dir
+  history = "full" if args.changes else "lifespan"
+  _claim_history(output_dir, history)
+  UI.line()
+  if _ensure_urls(output_dir, args.input, args.scope, args.witnesses):
+    UI.line()
+
+  urls, total_urls = _load_urls(output_dir, args.limit, shard, num_shards)
+  if total_urls == 0:
+    raise UIError("No URLs found. Point --input at a file/folder, or domain.")
+
+  only = _witness_names(args.witnesses)
   all_witnesses = [live_witness()] + archive_witnesses()
   if only:
     all_witnesses = [w for w in all_witnesses if w.name in only]
   archive_count = sum(1 for w in all_witnesses if w.name != "live_web")
 
-  UI.line()
-  UI.log("info", "Initialising Pluto...")
-  UI.tree([
-    f"URLs: {len(df):,}",
-    f"Witnesses: {len(all_witnesses)} (live_web + {archive_count} {_plural(archive_count, 'archive')})"
-    f"{f' -- shard {shard}/{num_shards}' if num_shards > 1 else ''}"
-    f"{', stop-early' if stop_early else ''}, workers={workers or 'auto'}",
-    f"Logs: {Path(output_dir) / 'pluto.log'} (pass -v to also stream them here)",
-  ])
-  UI.line()
-  UI.log("info", "Running Pluto...")
+  details = [f"live_web + {archive_count} {_plural(archive_count, 'archive')}"]
+  if num_shards > 1:
+    details.append(f"shard {shard}/{num_shards}")
+  if args.stop_early:
+    details.append("stop-early")
+  details.append("full histories" if args.changes else "first and last captures")
+  if args.workers:
+    details.append(f"{args.workers} workers")
+  UI.log("info", f"Running {len(urls):,} {_plural(len(urls), 'URL')} across {len(all_witnesses)} "
+                 f"{_plural(len(all_witnesses), 'witness', 'witnesses')} ({', '.join(details)})")
+  UI.leaf(f"Logs: {Path(output_dir) / 'pluto.log'} (add -v to stream them here)")
   summary = run_witnesses(
-    list(zip(df["url_id"], df["original_url"])),
+    urls,
     output_dir=output_dir, only_witnesses=only,
-    max_workers=workers, shard=shard, num_shards=num_shards,
-    stop_early=stop_early, stop_early_threshold=stop_early_threshold,
-    report_changes=report_changes,
+    max_workers=args.workers, shard=shard, num_shards=num_shards,
+    stop_early=args.stop_early, stop_early_threshold=args.stop_early_threshold,
+    report_changes=args.report_changes, history=history,
   )
   UI.line()
-  UI.log("ok", "Run complete!")
-  UI.tree([f"{k.replace('_', ' ').title()}: {v:,}" for k, v in summary.items()])
+  problems = []
+  if summary["permanent_failure"]:
+    problems.append(f"{summary['permanent_failure']:,} {_plural(summary['permanent_failure'], 'query', 'queries')} failed for good")
+  if summary["unexpected_errors"]:
+    problems.append(f"{summary['unexpected_errors']:,} unexpected {_plural(summary['unexpected_errors'], 'error')} (details in pluto.log)")
+  if summary["abandoned_witnesses"]:
+    problems.append(f"{summary['abandoned_witnesses']} {_plural(summary['abandoned_witnesses'], 'archive')} left for the next run")
+  if problems:
+    UI.log("issue", "Run finished with issues: " + "; ".join(problems))
+  else:
+    UI.log("ok", "Run complete. Next: python pluto.py classify")
   UI.line()
 
 
-@cli.command(short_help="Classify every URL's state (S0-S4) from its collected evidence.")
-@click.option("--corroboration-threshold", type=int, default=DEFAULT_CORROBORATION_THRESHOLD,
-       help="Independent witnesses required to score a URL S3.")
-@click.option("--no-summarize", is_flag=True, default=False,
-       help="Skip the automatic summarize step (stage 4) that normally runs after classifying.")
-@click.pass_context
-def classify(ctx, corroboration_threshold: int, no_summarize: bool):
-  output_dir = ctx.obj["output_dir"]
+def cmd_classify(args) -> None:
+  output_dir = args.output_dir
   UI.line()
-  UI.log("info", "Classifying observed URLs...")
+  UI.log("info", "Classifying URLs...")
   established_by_archive = established_years()
-  n = classify_all(output_dir, corroboration_threshold=corroboration_threshold,
-           established_by_archive=established_by_archive)
-  UI.log("ok", "Classify complete!")
-  details = [
-    f"Classified: {n:,} {_plural(n, 'URL')} ({len(established_by_archive):,} "
-    f"{_plural(len(established_by_archive), 'archive')} with a known establishment date)",
-    f"Events: {table_dir(output_dir, 'events')}",
-  ]
-  if not no_summarize:
-    path, n_rows = summarize_urls(output_dir, out_path=None, established_by_archive=established_by_archive)
-    details.append(f"Summary: {n_rows:,} {_plural(n_rows, 'row')} -> {path}")
+  with_changes = _read_history(output_dir) != "lifespan"
+  n = classify_all(output_dir, corroboration_threshold=args.corroboration_threshold,
+           established_by_archive=established_by_archive, with_changes=with_changes)
+  details = []
+  if not args.no_summarize:
+    path, _ = summarize_urls(output_dir, out_path=None, established_by_archive=established_by_archive)
+    details.append(f"Summary: {path}")
+  details.append(f"Events: {table_dir(output_dir, 'events')}")
+  UI.log("ok", f"Classified {n:,} {_plural(n, 'URL')}"
+         f"{'' if with_changes else ' (lifespan only: S1 needs a run with --changes)'}")
   UI.tree(details)
   UI.line()
 
 
-@cli.command(short_help="Rebuild summary.parquet from existing events, without reclassifying.")
-@click.option("--out", type=click.Path(path_type=Path), default=None,
-       help="Output path (default: <output-dir>/summary.parquet).")
-@click.pass_context
-def summarize(ctx, out: Path | None):
-  UI.line()
-  UI.log("info", "Summarizing...")
-  path, n = summarize_urls(ctx.obj["output_dir"], out_path=out, established_by_archive=established_years())
-  UI.log("ok", "Summarize complete!")
-  UI.tree([f"Wrote {n:,} {_plural(n, 'row')} -> {path}"])
-  UI.line()
-
-
-@cli.command("list-archives", short_help="List the archives loaded from the registry.")
-@click.pass_context
-def archives(ctx):
+def cmd_list_archives(args) -> None:
   witnesses = archive_witnesses()
   UI.line()
   UI.log("info", f"{len(witnesses)} {_plural(len(witnesses), 'archive')} loaded from registry/")
@@ -2151,18 +2979,16 @@ def archives(ctx):
   UI.line()
 
 
-@cli.command(short_help="Copy every table to a single clean Parquet file per table.")
-@click.option("--out", type=click.Path(path_type=Path), default=None,
-       help="Output directory (default: <output-dir>/export).")
-@click.pass_context
-def export(ctx, out: Path | None):
-  output_dir = ctx.obj["output_dir"]
-  out_dir = out or (Path(output_dir) / "export")
+def cmd_export(args) -> None:
+  import shutil
+
+  output_dir = args.output_dir
+  out_dir = args.out or (Path(output_dir) / "export")
   out_dir.mkdir(parents=True, exist_ok=True)
   con = duckdb.connect()
 
   UI.line()
-  UI.log("info", f"Exporting tables to {out_dir}...")
+  UI.log("info", "Exporting tables...")
   rows = []
   for table in TABLES:
     glob = str(table_dir(output_dir, table) / "*.parquet")
@@ -2176,23 +3002,20 @@ def export(ctx, out: Path | None):
 
   summary_src = Path(output_dir) / "summary.parquet"
   if summary_src.exists():
-    import shutil
-
     shutil.copy2(summary_src, out_dir / "summary.parquet")
     rows.append("summary.parquet: copied")
 
-  UI.log("ok", "Export complete!")
+  UI.log("ok", f"Exported to {out_dir}")
   UI.tree(rows)
   UI.line()
 
 
-@cli.command("fetch-archives", short_help="Download the latest archive registry from web-archive.txt.")
-@click.option("--source", type=click.Path(exists=True, path_type=Path), default=None,
-       help="Existing local checkout of web-archive.txt's registry/ dir, instead of cloning.")
-def fetch_registry(source: Path | None):
+def cmd_fetch_archives(args) -> None:
+  if args.source is not None and not args.source.exists():
+    raise UIError(f"--source {args.source} does not exist.")
   UI.line()
   UI.log("info", "Fetching web archive registry from web-archive.txt...")
-  n = import_registry(source=source)
+  n = import_registry(source=args.source)
   UI.log("ok", f"Imported {n:,} web-archive.txt {_plural(n, 'descriptor')} into {REGISTRY_DIR}")
 
   notes = scan_backfill_notes()
@@ -2210,55 +3033,90 @@ def fetch_registry(source: Path | None):
   UI.line()
 
 
-@cli.command(short_help="Show row counts per table, e.g. to check progress on a long run.")
-@click.pass_context
-def status(ctx):
-  output_dir = ctx.obj["output_dir"]
-  con = duckdb.connect()
+def build_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(
+    prog="pluto.py", description="Reconstruct web URL histories across the live web and web archives.",
+  )
+  parser.add_argument("--output", dest="output_dir", type=Path, default=OUTPUT_DIR, metavar="PATH",
+    help="Root directory for parquet tables, raw responses and checkpoints (default: output/).")
+  parser.add_argument("-v", "--verbose", action="store_true", help="Also stream INFO-level logs to the terminal.")
+  sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-  def count(table: str) -> int:
-    try:
-      glob = str(table_dir(output_dir, table) / "*.parquet")
-      return con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
-    except duckdb.IOException:
-      return 0
+  p = sub.add_parser("fetch-archives", help="Download the latest archive registry from web-archive.txt.")
+  p.add_argument("--source", type=Path, default=None, metavar="PATH",
+    help="Existing local checkout of web-archive.txt's registry/ dir, instead of cloning.")
+  p.set_defaults(func=cmd_fetch_archives)
 
-  UI.line()
-  UI.log("info", f"Status ({output_dir})")
-  rows = [f"{table}: {count(table):,} {_plural(count(table), 'row')}" for table in ["urls", "observations", "captures"]]
+  p = sub.add_parser("list-archives", help="List the archives loaded from the registry.")
+  p.set_defaults(func=cmd_list_archives)
 
-  events_glob = str(table_dir(output_dir, "events") / "*.parquet")
+  p = sub.add_parser("run", help="Query the live web and every archive for each URL in the study.")
+  p.add_argument("--input", action="append", default=[], metavar="PATH|DOMAIN",
+    help="A URL list (file or folder), or a bare domain to discover URLs for; repeat to mix, "
+         "e.g. --input urls.csv --input example.com. Anything that exists on disk is read as a "
+         f"URL list, anything else is treated as a domain. Default: auto-detect a list in {INPUT_DIR}. "
+         "Ignored once URLs already exist for this study.")
+  p.add_argument("--scope", default=None, metavar="SCOPE",
+    help="What to discover for a domain given via --input: root (its own homepage), hosts (one "
+         "homepage per subdomain), deep (every archived URL with a path), or a comma-separated "
+         "mix. Default: all.")
+  p.add_argument("--witnesses", default=None, metavar="IDS",
+    help="Comma-separated witnesses to query, e.g. live_web,ia,arq. Default: all. Also limits "
+         "which archives --scope searches.")
+  p.add_argument("--limit", type=int, default=None, metavar="N", help="Only query the first N URLs.")
+  p.add_argument("--workers", type=int, default=None, metavar="N",
+    help="Worker threads. Default: sized automatically from each witness's rate.")
+  p.add_argument("--shard", default=None, metavar="I/N",
+    help="This process's shard, e.g. 2/8. Detected automatically from SLURM/SGE job arrays.")
+  p.add_argument("--stop-early", action="store_true",
+    help="Skip a URL's remaining witnesses once its state is already certain "
+         "(any witness alive, or enough independent witnesses inaccessible).")
+  p.add_argument("--stop-early-threshold", type=int, default=None, metavar="N",
+    help=f"Inaccessible witnesses needed to stop early (default: {DEFAULT_CORROBORATION_THRESHOLD}).")
+  p.add_argument("--changes", action="store_true",
+    help="Fetch each archive's full capture history so content changes (S1) can be detected. "
+         "Default: only the first and last capture per archive.")
+  p.add_argument("--report-changes", action="store_true",
+    help="Print a line whenever an archive's history shows a content change (needs --changes).")
+  p.set_defaults(func=cmd_run)
+
+  p = sub.add_parser("classify", help="Classify every URL's state (S0-S4) from its collected evidence.")
+  p.add_argument("--corroboration-threshold", type=int, default=DEFAULT_CORROBORATION_THRESHOLD, metavar="N",
+    help="Independent witnesses required to score a URL S3.")
+  p.add_argument("--no-summarize", action="store_true", help="Skip writing summary.parquet.")
+  p.set_defaults(func=cmd_classify)
+
+  p = sub.add_parser("export", help="Copy every table to a single clean Parquet file per table.")
+  p.add_argument("--out", type=Path, default=None, metavar="PATH", help="Output directory (default: <output>/export).")
+  p.set_defaults(func=cmd_export)
+  return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+  parser = build_parser()
+  args = parser.parse_args(argv)
+  if not args.command:
+    parser.print_help()
+    return 0
+  output_dir = Path(args.output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  handlers: list[logging.Handler] = [logging.FileHandler(output_dir / "pluto.log")]
+  if args.verbose:
+    handlers.append(logging.StreamHandler())
+  logging.basicConfig(level=logging.INFO, handlers=handlers, force=True,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+  args.output_dir = output_dir
+  init_tables(output_dir)
   try:
-    breakdown = con.execute(
-      f"SELECT event_type, count(*) AS n FROM read_parquet('{events_glob}') "
-      "GROUP BY event_type ORDER BY n DESC"
-    ).fetchall()
-  except duckdb.IOException:
-    breakdown = []
-  n_events = sum(n for _, n in breakdown)
-  events_row = f"events: {n_events:,} {_plural(n_events, 'row')}"
-  if breakdown:
-    events_row += " (" + ", ".join(f"{event_type}: {n:,}" for event_type, n in breakdown) + ")"
-  rows.append(events_row)
-
-  from collections import Counter
-
-  ckpt_dbs = [Path(output_dir) / "checkpoints.db"] if (Path(output_dir) / "checkpoints.db").exists() \
-    else sorted((Path(output_dir) / "checkpoints").glob("shard-*.db"))
-  totals = Counter()
-  for db in ckpt_dbs:
-    conn = sqlite3.connect(db)
-    for state, n in conn.execute("SELECT state, count(*) FROM checkpoints GROUP BY state"):
-      totals[state] += n
-    conn.close()
-  if totals:
-    ckpt_row = f"checkpoints ({len(ckpt_dbs)} {_plural(len(ckpt_dbs), 'shard')}): " + \
-      ", ".join(f"{state}: {n:,}" for state, n in totals.items())
-    rows.append(ckpt_row)
-
-  UI.tree(rows)
-  UI.line()
+    args.func(args)
+  except UIError as exc:
+    UI.log("error", str(exc))
+    return 1
+  except KeyboardInterrupt:
+    print("\nInterrupted. Progress is saved; run the same command again to resume.")
+    return 130
+  return 0
 
 
 if __name__ == "__main__":
-  cli()
+  sys.exit(main())
