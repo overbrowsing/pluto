@@ -104,6 +104,8 @@ OUTPUT_SETTINGS = {
 
 DEFAULT_CORROBORATION_THRESHOLD = 2
 
+CONTENT_REPLACEMENT_LENGTH_RATIO = 0.5
+
 
 @dataclass
 class WitnessConfig:
@@ -1079,6 +1081,17 @@ class CheckpointStore:
         raise
       cur.execute("COMMIT")
 
+  def clear_permanent_failures(self, witnesses: list[str]) -> int:
+    if not witnesses:
+      return 0
+    placeholders = ",".join("?" for _ in witnesses)
+    with self._lock, self._cursor() as cur:
+      cur.execute(
+        f"DELETE FROM checkpoints WHERE state=? AND witness IN ({placeholders})",
+        (PERMANENT_FAILURE, *witnesses),
+      )
+      return cur.rowcount
+
   def close(self) -> None:
     self._conn.close()
 
@@ -1874,6 +1887,7 @@ def run_witnesses(
   stop_early_threshold: int | None = None,
   report_changes: bool = False,
   history: str = "full",
+  retry_failed: bool = False,
 ) -> dict:
   flush_every = flush_every or OUTPUT_SETTINGS["flush_rows"]
   flush_interval = OUTPUT_SETTINGS["flush_interval_seconds"]
@@ -1900,6 +1914,13 @@ def run_witnesses(
   raw_store = RawStore(output_dir, tag=raw_tag)
   url_ids = sorted(urls)
   witness_names = list(runtimes.keys())
+  if retry_failed:
+    cleared = store.clear_permanent_failures(witness_names)
+    if cleared:
+      logging.getLogger(__name__).info(
+        "run: --retry cleared %d permanently-failed checkpoint(s) for %s; "
+        "retrying them this run.", cleared, ", ".join(witness_names),
+      )
   done_bits = _load_done_bits(store, url_ids, witness_names)
 
   obs_buffer: list[dict] = []
@@ -2192,6 +2213,7 @@ def run_witnesses(
 
 S0_ALIVE = "S0"
 S1_CONTENT_CHANGED = "S1"
+S2_URL_SURVIVES_CONTENT_GONE = "S2"
 S3_STRONG_DISAPPEARANCE = "S3"
 S4_UNRESOLVED = "S4"
 
@@ -2274,6 +2296,39 @@ def _content_survival(observations: list[dict], captures: list[dict]) -> str:
   return "unknown"
 
 
+def _content_trajectory(observations: list[dict], captures: list[dict]) -> str | None:
+
+  def _from_series(triples: list[tuple]) -> str | None:
+    with_length = sorted((t, ln) for t, _, ln in triples if ln is not None and ln > 0)
+    if len(with_length) < 2:
+      return None
+    first_len, last_len = with_length[0][1], with_length[-1][1]
+    ratio = min(first_len, last_len) / max(first_len, last_len)
+    return "replaced" if ratio < CONTENT_REPLACEMENT_LENGTH_RATIO else "edited"
+
+  live = [
+    (o["observation_time"], o["content_digest"], o.get("content_length"))
+    for o in observations if o.get("observer") == "live_web" and o.get("content_digest")
+  ]
+  if len({d for _, d, _ in live}) > 1:
+    result = _from_series(live)
+    if result:
+      return result
+
+  by_archive: dict[str, list] = {}
+  for c in captures:
+    if c.get("digest"):
+      by_archive.setdefault(c["archive"], []).append(
+        (c["capture_time"], c["digest"], c.get("content_length"))
+      )
+  for series in by_archive.values():
+    if len({d for _, d, _ in series}) > 1:
+      result = _from_series(series)
+      if result:
+        return result
+  return None
+
+
 def _witness_digest_transitions(observations: list[dict], captures: list[dict]) -> list[dict]:
   series_by_witness: dict[str, list[tuple]] = {}
 
@@ -2312,7 +2367,13 @@ def classify_resource_state(
   content_survival = _content_survival(observations, captures) if with_changes else "unknown"
 
   if alive:
-    state = S1_CONTENT_CHANGED if content_survival == "changed" else S0_ALIVE
+    trajectory = _content_trajectory(observations, captures) if content_survival == "changed" else None
+    if trajectory == "edited":
+      state = S1_CONTENT_CHANGED
+    elif trajectory == "replaced":
+      state = S2_URL_SURVIVES_CONTENT_GONE
+    else:
+      state = S0_ALIVE
   elif len(inaccessible) >= corroboration_threshold:
     state = S3_STRONG_DISAPPEARANCE
   else:
@@ -2335,7 +2396,7 @@ def archival_risk(
   resource_state: dict,
   established_by_archive: dict[str, int] | None = None,
 ) -> dict:
-  ever_existed = resource_state["state"] in ("S0", "S1", "S3")
+  ever_existed = resource_state["state"] in ("S0", "S1", "S2", "S3")
   preserved = resource_state["preserved"]
   latest_obs = _latest_by(observations, "observer", "observation_time")
   alive = any(o["status"] == _ALIVE_STATUS for o in latest_obs.values())
@@ -2920,6 +2981,8 @@ def cmd_run(args) -> None:
     details.append(f"shard {shard}/{num_shards}")
   if args.stop_early:
     details.append("stop-early")
+  if args.retry:
+    details.append("retrying past failures")
   details.append("full histories" if args.changes else "first and last captures")
   if args.workers:
     details.append(f"{args.workers} workers")
@@ -2931,7 +2994,7 @@ def cmd_run(args) -> None:
     output_dir=output_dir, only_witnesses=only,
     max_workers=args.workers, shard=shard, num_shards=num_shards,
     stop_early=args.stop_early, stop_early_threshold=args.stop_early_threshold,
-    report_changes=args.report_changes, history=history,
+    report_changes=args.report_changes, history=history, retry_failed=args.retry,
   )
   UI.line()
   problems = []
@@ -2962,7 +3025,7 @@ def cmd_classify(args) -> None:
     details.append(f"Summary: {path}")
   details.append(f"Events: {table_dir(output_dir, 'events')}")
   UI.log("ok", f"Classified {n:,} {_plural(n, 'URL')}"
-         f"{'' if with_changes else ' (lifespan only: S1 needs a run with --changes)'}")
+         f"{'' if with_changes else ' (lifespan only: S1/S2 need a run with --changes)'}")
   UI.tree(details)
   UI.line()
 
@@ -3074,10 +3137,14 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("--stop-early-threshold", type=int, default=None, metavar="N",
     help=f"Inaccessible witnesses needed to stop early (default: {DEFAULT_CORROBORATION_THRESHOLD}).")
   p.add_argument("--changes", action="store_true",
-    help="Fetch each archive's full capture history so content changes (S1) can be detected. "
+    help="Fetch each archive's full capture history so content changes (S1/S2) can be detected. "
          "Default: only the first and last capture per archive.")
   p.add_argument("--report-changes", action="store_true",
     help="Print a line whenever an archive's history shows a content change (needs --changes).")
+  p.add_argument("--retry", action="store_true",
+    help="Also re-attempt URLs a witness gave up on for good last run (e.g. a live-web check "
+         "that never came back cleanly), not just ones it hasn't reached yet. Combine with "
+         "--witnesses to retry just one, e.g. --witnesses live_web --retry.")
   p.set_defaults(func=cmd_run)
 
   p = sub.add_parser("classify", help="Classify every URL's state (S0-S4) from its collected evidence.")
