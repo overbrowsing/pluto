@@ -47,7 +47,7 @@
       ```
 
 > [!TIP]
-> Stopped partway (or it crashed)? Just run the same command again to pick up where you left off.
+> Stopped partway, or did it crash? Just run the same command again to pick up where you left off.
 
    3. Classify:
 
@@ -59,9 +59,9 @@
 
       | State  | Definition                                                                                          |
       |--------|-----------------------------------------------------------------------------------------------------|
-      | **S0** | Resolves on the live web; no content change detected across observations                            |
-      | **S1** | Resolves on the live web; content (SHA-1 hash) has changed a little                                 |
-      | **S2** | Resolves on the live web; content (SHA-1 hash) has changed substantially or has been supplanted     |
+      | **S0** | Resolves; SHA-1 hash unchanged across observations                                                  |
+      | **S1** | Resolves; SHA-1 hash has changed, but content length is comparable (edited)                         |
+      | **S2** | Resolves; SHA-1 hash has changed and content length differs sharply (replaced)                      |
       | **S3** | No longer resolves; disappearance corroborated by the configured threshold of independent witnesses |
       | **S4** | No longer resolves; insufficient independent corroboration to confirm disappearance                 |
 
