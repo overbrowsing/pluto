@@ -2,7 +2,7 @@
 
 ## Overview
 
-*Pluto* is a research tool for reconstructing web URL histories. It supports research into URL lifespan, link rot, content change, and web persistence by comparing live sites with compatible web archives listed in our [web-archive.txt](https://github.com/overbrowsing/web-archive.txt) registry. Findings are corroborated across archives rather than relying on a single source, following the Roman maxim testis unus, *testis unus, testis nullus* (one witness is no witness). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
+*Pluto* is a research tool for reconstructing web URL histories. It supports research into URL lifespan, link rot, content change, and web persistence by querying supported web archives listed in our [web-archive.txt registry](https://github.com/overbrowsing/web-archive.txt#registry) and the live web. Findings are corroborated across archives rather than relying on a single source, following the Roman maxim testis unus, *testis unus, testis nullus* (one witness is no witness). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
 
 ## Installation
 
@@ -36,17 +36,18 @@
 
       # Flags
 
-      --input <path|domain>           # URL list file/folder or domain; default: input/ e.g. path/to/folder/ or example.com
-      --scope <root|hosts|deep|all>   # scope (default: all) e.g. root,hosts
-      --changes                       # fetch full capture histories to detect content changes (S1/S2); default: first and last capture only
-      --witnesses <ids>               # web archives to query (default: all) e.g. ia,arq
-      --workers <n>                   # concurrent workers e.g. 30
+      --input <path|domain>           # URL list file/folder or URL; default: input/, e.g. path/to/folder/ or example.com
+      --output <path>                 # output directory; default: output/, e.g. path/to/folder/
+      --scope <root|hosts|deep|all>   # scope (default: all), e.g. root,hosts
+      --changes                       # fetch full capture histories to detect content (SHA-1 hash) changes; default: first and last capture only
+      --witnesses <ids>               # web archives to query (default: all), e.g. live_web,ia,arq
+      --retry                         # re-attempt witnesses that failed last run (default: all), e.g. live_web,ia,arq
+      --workers <n>                   # concurrent workers, e.g. 30
       --shard <i>/<n>                 # HPC job shard, e.g. 2/8
-      --output <path>                 # output directory; default: output/ e.g. path/to/folder/
       ```
 
 > [!TIP]
-> Stopped partway (or it crashed)? Just run the same command again.
+> Stopped partway (or it crashed)? Just run the same command again to pick up where you left off.
 
    3. Classify:
 
@@ -59,8 +60,8 @@
       | State  | Definition                                                                                          |
       |--------|-----------------------------------------------------------------------------------------------------|
       | **S0** | Resolves on the live web; no content change detected across observations                            |
-      | **S1** | Resolves on the live web; content has been edited                                                   |
-      | **S2** | Resolves on the live web; content has changed substantially or has been supplanted                  |
+      | **S1** | Resolves on the live web; content (SHA-1 hash) has changed a little                                 |
+      | **S2** | Resolves on the live web; content (SHA-1 hash) has changed substantially or has been supplanted     |
       | **S3** | No longer resolves; disappearance corroborated by the configured threshold of independent witnesses |
       | **S4** | No longer resolves; insufficient independent corroboration to confirm disappearance                 |
 
@@ -89,8 +90,6 @@ Developed by [Overbrowsing](https://overbrowsing.com) at the [Institute for Desi
 ## Citing
 
 If you use, implement, or reference this project, please cite it as '*Pluto*' and include clear attribution in publications, software, or documentation where appropriate.
-
-A publication related to this project is forthcoming.
 
 ## Licenses
 
