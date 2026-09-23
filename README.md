@@ -57,13 +57,13 @@
 
       Classify assigns every URL one of five states (S0-S4):
 
-      | State  | Definition                                                                                               |
-      |--------|----------------------------------------------------------------------------------------------------------|
-      | **S0** | Resolves; SHA-1 hash unchanged across observations                                                       |
-      | **S1** | Resolves; SHA-1 hash has changed, but content length to last capture is comparable (edited)              |
-      | **S2** | Resolves; SHA-1 hash has changed and content length to last capture differs sharply (replaced/suplanted) |
-      | **S3** | No longer resolves; disappearance corroborated by the configured threshold of independent witnesses      |
-      | **S4** | No longer resolves; insufficient independent corroboration to confirm disappearance                      |
+      | State  | Definition                                                                                       |
+      |--------|--------------------------------------------------------------------------------------------------|
+      | **S0** | Resolves on the live web; no content change detected, or too few observations to test for change |
+      | **S1** | Resolves; content has changed, but size is comparable                                            |
+      | **S2** | Resolves; content has changed and size differs by more than half, consistent with replacement    |
+      | **S3** | Does not resolve; at least two witnesses (the default threshold) report it inaccessible          |
+      | **S4** | Does not resolve; too few witnesses report it inaccessible to confirm disappearance              |
 
 ## Results
 
