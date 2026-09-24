@@ -38,10 +38,11 @@
 
       --input <path|domain>           # URL list file/folder or URL; default: input/, e.g. path/to/folder/ or example.com
       --output <path>                 # output directory; default: output/, e.g. path/to/folder/
-      --scope <root|hosts|deep|all>   # scope (default: all), e.g. root,hosts
-      --changes                       # fetch full capture histories to detect content (SHA-1 hash) changes; default: first and last capture only
+      --scope <root|hosts|deep|all>   # what to discover for a domain, or filter for a file/folder; default: all = root+hosts+deep
+      --changes                       # fetch full capture histories to detect content changes by digest; default: first and last capture only
       --witnesses <ids>               # web archives to query (default: all), e.g. live_web,ia,arq
-      --retry                         # re-attempt witnesses that failed last run (default: all), e.g. live_web,ia,arq
+      --min-witnesses <n>             # witnesses needed to stop early (default: 2; off with --changes unless set explicitly)
+      --retry                         # re-attempt witnesses that failed for good last run; pair with --witnesses to retry just one, e.g. --witnesses live_web --retry
       --workers <n>                   # concurrent workers, e.g. 30
       --shard <i>/<n>                 # HPC job shard, e.g. 2/8
       ```
