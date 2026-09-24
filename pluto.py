@@ -56,7 +56,7 @@ UPSTREAM_REGISTRY = "https://github.com/overbrowsing/web-archive.txt.git"
 
 # ------------------- Settings -------------------
 
-USER_AGENT = "Pluto :: Overbrowsing"
+USER_AGENT = os.environ.get("PLUTO_USER_AGENT", "Pluto :: Overbrowsing")
 
 LIVE_WEB_SETTINGS = {
   "timeout_seconds": 10,
