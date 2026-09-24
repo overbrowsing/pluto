@@ -84,8 +84,10 @@ RATE_LIMITER_SETTINGS = {
 CIRCUIT_BREAKER_SETTINGS = {
   "failure_threshold": 5,
   "cooldown_seconds": 120,
-  "max_failed_health_checks": 30,
-  "max_failed_health_checks_before_first_success": 5,
+}
+
+UNREACHABLE_SETTINGS = {
+  "grace_seconds_once_only_unreachable_left": 300,
 }
 
 CONCURRENCY_SETTINGS = {
@@ -1132,8 +1134,6 @@ def should_retry(error_class: str, attempts_so_far: int) -> bool:
 class CircuitBreaker:
   failure_threshold: int = 5
   cooldown_seconds: float = 120
-  max_failed_health_checks: int = 30
-  max_failed_health_checks_before_first_success: int = 5
 
   _consecutive_failures: int = field(default=0, init=False)
   _failed_health_checks: int = field(default=0, init=False)
@@ -1155,11 +1155,6 @@ class CircuitBreaker:
     with self._lock:
       self._failed_health_checks += 1
       self._open_since = time.monotonic()
-
-  @property
-  def given_up(self) -> bool:
-    with self._lock:
-      return self._open_since is not None and self._failed_health_checks >= self.max_failed_health_checks
 
   @property
   def failed_health_checks(self) -> int:
@@ -2002,6 +1997,15 @@ def run_witnesses(
   probing = {w: False for w in witness_names}
   abandoned: set[str] = set()
   seq = iter(range(1 << 62))
+  unreachable_grace = UNREACHABLE_SETTINGS["grace_seconds_once_only_unreachable_left"]
+  only_unreachable_since: float | None = None
+
+  def only_unreachable_left() -> bool:
+    return not any(
+      w not in abandoned and not runtimes[w].breaker.is_open
+      and (inflight[w] or retry_heaps[w] or not exhausted[w])
+      for w in witness_names
+    )
 
   caps = {
     w: _witness_concurrency_cap(runtimes[w].limiter.min_interval, runtimes[w].config.timeout_seconds)
@@ -2082,19 +2086,17 @@ def run_witnesses(
     if w in abandoned:
       return
     breaker = runtimes[w].breaker
-    while inflight[w] < caps[w]:
-      never_reached = (
-        breaker.is_open and succeeded_by_witness[w] == 0
-        and breaker.failed_health_checks >= breaker.max_failed_health_checks_before_first_success
+    if (
+      breaker.is_open and only_unreachable_since is not None
+      and time.monotonic() - only_unreachable_since >= unreachable_grace
+    ):
+      abandoned.add(w)
+      logger.warning(
+        "%s: still unreachable after %d failed health checks and every other archive has "
+        "finished; its remaining URLs are left for the next run.", w, breaker.failed_health_checks,
       )
-      if breaker.given_up or never_reached:
-        abandoned.add(w)
-        logger.warning(
-          "%s: circuit breaker stayed open through %d failed health checks%s; its remaining "
-          "URLs are left for the next run.", w, breaker.failed_health_checks,
-          " without a single successful request" if never_reached else "",
-        )
-        return
+      return
+    while inflight[w] < caps[w]:
       probe = breaker.is_open
       if probe and (probing[w] or not breaker.ready_for_health_check()):
         return
@@ -2117,7 +2119,11 @@ def run_witnesses(
         continue
       breaker = runtimes[w].breaker
       if breaker.is_open:
-        out.append(f"{w} (unreachable; next check in {breaker.seconds_until_health_check:,.0f}s)")
+        note = f"unreachable; next check in {breaker.seconds_until_health_check:,.0f}s"
+        if only_unreachable_since is not None:
+          left = max(0.0, unreachable_grace - (time.monotonic() - only_unreachable_since))
+          note += f"; left for next run in {left:,.0f}s"
+        out.append(f"{w} ({note})")
       elif retry_heaps[w]:
         out.append(f"{w} (retrying after a failure)")
     return out
@@ -2171,6 +2177,11 @@ def run_witnesses(
           break
       touched = {handle(fut) for fut in batch}
       now = time.monotonic()
+      if only_unreachable_left():
+        if only_unreachable_since is None:
+          only_unreachable_since = now
+      else:
+        only_unreachable_since = None
       if now - last_tick >= 1.0:
         touched = set(witness_names)
         last_tick = now
@@ -2213,7 +2224,7 @@ def run_witnesses(
   summary["abandoned_witnesses"] = len(abandoned)
   UI.progress(summary, completed + summary["skipped_early_stop"], total_tasks, start_time, tty, final=True)
   if abandoned:
-    UI.log("issue", f"Left for the next run (never reachable): {', '.join(sorted(abandoned))}")
+    UI.log("issue", f"Left for the next run (still unreachable): {', '.join(sorted(abandoned))}")
   unreliable = sorted(
     w for w, rt in runtimes.items()
     if isinstance(rt.adapter, WebArchiveAdapter) and rt.adapter.latest_unreliable()
