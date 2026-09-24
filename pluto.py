@@ -1336,6 +1336,7 @@ def sample_from_files(
   seed: int = 1337,
   batch_size: int = 500_000,
   show_progress: bool = False,
+  allowed_url_types: frozenset[str] | None = None,
 ) -> tuple[Path | None, int, int]:
   total_added = total_skipped = 0
   n_rows_seen = 0
@@ -1360,7 +1361,10 @@ def sample_from_files(
 
   def all_rows():
     for p in candidates_paths:
-      yield from _iter_candidate_rows(p)
+      for row in _iter_candidate_rows(p):
+        if allowed_url_types is not None and _row_scope_type(row) not in allowed_url_types:
+          continue
+        yield row
 
   if n is None:
     batch: list[dict] = []
@@ -1508,7 +1512,7 @@ _SCOPE_ALIASES = {
   "root": frozenset({"root"}),
   "hosts": frozenset({"hosts"}),
   "deep": frozenset({"deep"}),
-  "all": frozenset({"hosts", "deep"}),
+  "all": frozenset({"root", "hosts", "deep"}),
 }
 
 
@@ -1524,9 +1528,26 @@ def _parse_scope(value: str) -> frozenset[str]:
   return frozenset(resolved)
 
 
+def _row_scope_type(row: dict) -> str:
+  url_type = row.get("url_type")
+  if url_type in ("root", "deep"):
+    return url_type
+  path = urlsplit(canonicalize(row["url"])).path
+  return "root" if path == "/" else "deep"
+
+
+def _scope_allowed_url_types(scope: frozenset[str]) -> frozenset[str]:
+  allowed = set()
+  if "root" in scope or "hosts" in scope:
+    allowed.add("root")
+  if "deep" in scope:
+    allowed.add("deep")
+  return frozenset(allowed)
+
+
 def discover_candidates(
   domain: str,
-  scope: frozenset[str] | set[str] = frozenset({"hosts", "deep"}),
+  scope: frozenset[str] | set[str] = frozenset({"root", "hosts", "deep"}),
   registry_dir: Path = REGISTRY_DIR,
   only_archives: list[str] | None = None,
   page_size: int = 500_000,
@@ -1877,9 +1898,8 @@ def run_witnesses(
   max_workers: int | None = None,
   shard: int = 0,
   num_shards: int = 1,
-  stop_early: bool = False,
+  stop_early: bool = True,
   stop_early_threshold: int | None = None,
-  report_changes: bool = False,
   history: str = "full",
   retry_failed: bool = False,
 ) -> dict:
@@ -2129,16 +2149,6 @@ def run_witnesses(
     obs_buffer.extend(result.get("observations", []))
     cap_buffer.extend(result.get("captures", []))
     _record_evidence(uid, w, result.get("observations", []))
-    if report_changes:
-      transitions = _witness_digest_transitions(
-        result.get("observations", []), result.get("captures", []),
-      )
-      if transitions:
-        latest = max(transitions, key=lambda t: t["first_new_time"])
-        UI._progress_lines = 0
-        UI.log("info", f"{urls[uid]} -- {len(transitions)} content "
-                f"change(s) seen by {latest['witness']}, most recent "
-                f"{latest['first_new_time']:%Y-%m-%d %H:%M} UTC")
     return w
 
   previous_sigterm = _install_sigterm_handler()
@@ -2808,10 +2818,8 @@ def _prepare_urls(output_dir: Path, input_values, scope_spec: str | None, only_w
   domain_values = [v for v in input_values if not Path(v).exists()]
   path_values = [Path(v) for v in input_values if Path(v).exists()]
 
-  if scope_spec and not domain_values:
-    raise UIError("--scope only does something when --input includes a "
-            "domain (not just files/folders).")
-  scope = _parse_scope(scope_spec or "all") if domain_values else None
+  scope = _parse_scope(scope_spec) if scope_spec else None
+  file_scope_types = _scope_allowed_url_types(scope) if scope else None
 
   discover_archives = None
   if only_witnesses:
@@ -2826,12 +2834,12 @@ def _prepare_urls(output_dir: Path, input_values, scope_spec: str | None, only_w
           f"No URLs picked yet, and no input found. Put a URL list (.csv or .gz) "
           f"in {INPUT_DIR} -- or point --input at a file/folder, or domain."
         )
-      _pick_from_files(output_dir, paths)
+      _pick_from_files(output_dir, paths, allowed_url_types=file_scope_types)
     else:
       if path_values:
-        _pick_from_files(output_dir, _resolve_candidate_paths(path_values))
+        _pick_from_files(output_dir, _resolve_candidate_paths(path_values), allowed_url_types=file_scope_types)
       for d in domain_values:
-        rows = discover_candidates(d, scope=scope, only_archives=discover_archives)
+        rows = discover_candidates(d, scope=scope or frozenset({"root", "hosts", "deep"}), only_archives=discover_archives)
         if not rows:
           raise UIError(f"No captures found for {d} across the queried archives.")
         _, added, skipped = write_urls_table(output_dir, rows)
@@ -2839,10 +2847,10 @@ def _prepare_urls(output_dir: Path, input_values, scope_spec: str | None, only_w
                f"{f' ({skipped:,} already tracked)' if skipped else ''}")
 
 
-def _pick_from_files(output_dir: Path, paths: list[Path]) -> None:
+def _pick_from_files(output_dir: Path, paths: list[Path], allowed_url_types: frozenset[str] | None = None) -> None:
   names = ", ".join(Path(p).name for p in paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
   UI.log("info", f"Picking URLs from {names}...")
-  _, added, skipped = sample_from_files(output_dir, paths, show_progress=False)
+  _, added, skipped = sample_from_files(output_dir, paths, show_progress=False, allowed_url_types=allowed_url_types)
   UI.log("ok", f"{added:,} {_plural(added, 'URL')} picked"
          f"{f' ({skipped:,} duplicates skipped)' if skipped else ''}")
 
@@ -2958,8 +2966,6 @@ def _witness_names(spec: str | None) -> list[str] | None:
 
 
 def cmd_run(args) -> None:
-  if args.report_changes and not args.changes:
-    raise UIError("--report-changes needs --changes (it reads each archive's full history).")
   shard, num_shards = _parse_shard(args.shard)
 
   output_dir = args.output_dir
@@ -2979,11 +2985,15 @@ def cmd_run(args) -> None:
     all_witnesses = [w for w in all_witnesses if w.name in only]
   archive_count = sum(1 for w in all_witnesses if w.name != "live_web")
 
+  threshold_given = args.stop_early_threshold is not None
+  stop_early = threshold_given or not args.changes
+  stop_early_threshold = args.stop_early_threshold if threshold_given else DEFAULT_CORROBORATION_THRESHOLD
+
   details = [f"live_web + {archive_count} {_plural(archive_count, 'archive')}"]
   if num_shards > 1:
     details.append(f"shard {shard}/{num_shards}")
-  if args.stop_early:
-    details.append("stop-early")
+  if stop_early:
+    details.append(f"stop-early at {stop_early_threshold} inaccessible")
   if args.retry:
     details.append("retrying past failures")
   details.append("full histories" if args.changes else "first and last captures")
@@ -2996,8 +3006,8 @@ def cmd_run(args) -> None:
     urls,
     output_dir=output_dir, only_witnesses=only,
     max_workers=args.workers, shard=shard, num_shards=num_shards,
-    stop_early=args.stop_early, stop_early_threshold=args.stop_early_threshold,
-    report_changes=args.report_changes, history=history, retry_failed=args.retry,
+    stop_early=stop_early, stop_early_threshold=stop_early_threshold,
+    history=history, retry_failed=args.retry,
   )
   UI.line()
   problems = []
@@ -3134,16 +3144,16 @@ def build_parser() -> argparse.ArgumentParser:
     help="Worker threads. Default: sized automatically from each witness's rate.")
   p.add_argument("--shard", default=None, metavar="I/N",
     help="This process's shard, e.g. 2/8. Detected automatically from SLURM/SGE job arrays.")
-  p.add_argument("--stop-early", action="store_true",
-    help="Skip a URL's remaining witnesses once its state is already certain "
-         "(any witness alive, or enough independent witnesses inaccessible).")
-  p.add_argument("--stop-early-threshold", type=int, default=None, metavar="N",
-    help=f"Inaccessible witnesses needed to stop early (default: {DEFAULT_CORROBORATION_THRESHOLD}).")
+  p.add_argument("--min-witnesses", dest="stop_early_threshold", type=int,
+    default=None, metavar="N",
+    help="Skip a URL's remaining witnesses once its state is certain -- alive in one, or "
+         "inaccessible in at least N (pairs with --witnesses). On by default at "
+    f"N={DEFAULT_CORROBORATION_THRESHOLD}, except with --changes, where every witness's "
+         "full history is wanted instead; pass --min-witnesses explicitly to switch it back "
+         "on even with --changes.")
   p.add_argument("--changes", action="store_true",
     help="Fetch each archive's full capture history so content changes (S1/S2) can be detected. "
          "Default: only the first and last capture per archive.")
-  p.add_argument("--report-changes", action="store_true",
-    help="Print a line whenever an archive's history shows a content change (needs --changes).")
   p.add_argument("--retry", action="store_true",
     help="Also re-attempt URLs a witness gave up on for good last run (e.g. a live-web check "
          "that never came back cleanly), not just ones it hasn't reached yet. Combine with "
