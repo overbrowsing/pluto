@@ -23,10 +23,16 @@
 
 ## Usage
 
-   1. Fetch the [web-archive.txt registry](https://github.com/overbrowsing/web-archive.txt#registry):
+   1. Fetch all web archives from the [web-archive.txt registry](https://github.com/overbrowsing/web-archive.txt#registry):
 
       ```bash
       python pluto.py fetch-archives
+      ```
+
+      List all supported web archives and their IDs:
+
+      ```bash
+      python pluto.py list-archives
       ```
 
    2. Run Pluto:
