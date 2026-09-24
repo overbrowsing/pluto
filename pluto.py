@@ -289,8 +289,11 @@ def _display_name(name_field) -> str:
     return name_field
   if isinstance(name_field, list) and name_field:
     primary = name_field[0]
-    alt = next((n.get("alt") for n in name_field[1:] if isinstance(n, dict) and n.get("alt")), None)
-    return f"{primary} ({alt})" if alt else str(primary)
+    variants = [n for n in name_field[1:] if isinstance(n, dict)]
+    en = next((n.get("en") for n in variants if n.get("en")), None)
+    alt = next((n.get("alt") for n in variants if n.get("alt")), None)
+    suffix = en or alt
+    return f"{primary} ({suffix})" if suffix else str(primary)
   return "unknown"
 
 
@@ -366,7 +369,6 @@ def compile_archives(registry_dir: Path = REGISTRY_DIR) -> list[dict]:
   entries = [e for p in sorted(Path(registry_dir).glob("*/web-archive.txt")) if (e := _compile_one(p))]
   entries.sort(key=lambda e: e["id"])
   return entries
-
 
 # ------------------- Backfill-disclosure scanning -------------------
 
@@ -469,7 +471,6 @@ def archive_witnesses(registry_dir: Path = REGISTRY_DIR) -> list[WitnessConfig]:
       extra={"registry_entry": entry},
     ))
   return out
-
 
 # ------------------- Adapters -------------------
 
@@ -574,7 +575,7 @@ class LiveWebAdapter(ArchiveAdapter):
 
   def __init__(self, config):
     super().__init__(config)
-    self._session = _make_session()
+    self._session = _make_session(pool_size=160)
 
   def query(self, url: str) -> LiveResponse:
     host = urlsplit(url).hostname
@@ -984,7 +985,6 @@ class WebArchiveAdapter(ArchiveAdapter):
 
 ADAPTER_REGISTRY = {"LiveWebAdapter": LiveWebAdapter, "WebArchiveAdapter": WebArchiveAdapter}
 
-
 # ------------------- Reliability -------------------
 
 SUCCESS, RETRY, PERMANENT_FAILURE, SKIPPED_EARLY_STOP = (
@@ -1230,9 +1230,7 @@ class RateLimiter:
   def min_interval(self) -> float:
     return self._floor_interval
 
-
 # ------------------- Stage 1 -------------------
-
 
 def _iter_csv_rows(path: Path):
   with open(path, newline="", encoding="utf-8") as f:
@@ -1401,9 +1399,7 @@ def _resolve_candidate_paths(paths: list[Path]) -> list[Path]:
 def _default_candidates() -> list[Path]:
   return sorted(INPUT_DIR.glob("*.csv")) + sorted(INPUT_DIR.glob("*.gz"))
 
-
 # ------------------- Discover -------------------
-
 
 def _discover_cdx_bases(entry: dict) -> list[str]:
   endpoint = entry.get("cdx_endpoint") or ""
@@ -1602,9 +1598,7 @@ def discover_candidates(
          for url, ts in earliest_url.items() if url not in existing_urls]
   return rows
 
-
 # ------------------- Stage 2 -------------------
-
 
 class _RawSegment:
 
@@ -1994,13 +1988,26 @@ def run_witnesses(
     for w in witness_names
   }
   recommended_workers = sum(caps.values())
+  auto_cap = CONCURRENCY_SETTINGS["warn_total_threads"]
   if max_workers is None:
-    max_workers = recommended_workers
-    logging.getLogger(__name__).info(
-      "run: auto-sizing the worker pool to %d threads across %d witnesses (pass "
-      "--workers to override; each witness's own rate limit is still the real ceiling).",
-      max_workers, len(witness_names),
-    )
+    if recommended_workers > auto_cap:
+      max_workers = auto_cap
+      logging.getLogger(__name__).warning(
+        "run: witnesses could use up to %d threads total across %d witnesses, but "
+        "auto-sizing caps this at %d threads by default to stay well inside typical "
+        "per-user thread/file-descriptor limits on a shared HPC node. The busiest "
+        "witnesses will fall a bit behind their configured rate as a result -- pass "
+        "--workers %d explicitly if you've confirmed the node can take it (check "
+        "`ulimit -u` and `ulimit -n` first).",
+        recommended_workers, len(witness_names), auto_cap, recommended_workers,
+      )
+    else:
+      max_workers = recommended_workers
+      logging.getLogger(__name__).info(
+        "run: auto-sizing the worker pool to %d threads across %d witnesses (pass "
+        "--workers to override; each witness's own rate limit is still the real ceiling).",
+        max_workers, len(witness_names),
+      )
   elif max_workers < recommended_workers:
     logging.getLogger(__name__).info(
       "run: %d witnesses want up to %d worker slots total to each reach its own "
@@ -2207,7 +2214,6 @@ def run_witnesses(
                     f"capture, so this archive probably ignores sort=reverse and its latest dates can't be trusted "
                     f"(use --changes to fetch full histories instead)")
   return summary
-
 
 # ------------------- Stage 3 -------------------
 
@@ -2551,7 +2557,6 @@ def classify_all(
     os.replace(path, path.with_suffix(""))
   return classified
 
-
 # ------------------- Stage 4 -------------------
 
 _SUMMARY_QUERY = """
@@ -2679,9 +2684,7 @@ def summarize_urls(
   n = con.execute(f"SELECT count(*) FROM read_parquet('{out_path}')").fetchone()[0]
   return out_path, n
 
-
 # ------------------- CLI -------------------
-
 
 def _plural(n: int, word: str, plural: str | None = None) -> str:
   return word if n == 1 else (plural or f"{word}s")
