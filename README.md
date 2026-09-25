@@ -2,7 +2,7 @@
 
 ## Overview
 
-*Pluto* is a research tool for reconstructing web URL histories. It supports research into URL lifespan, link rot, content change, and web persistence by querying supported web archives listed in our [web-archive.txt registry](https://github.com/overbrowsing/web-archive.txt#registry) and the live web. Findings are corroborated across archives rather than relying on a single source, following the Roman maxim testis unus, *testis unus, testis nullus* (one witness is no witness). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
+*Pluto* is a research tool for reconstructing the history of websites as recorded by web archives. It supports research into URL lifespan, link rot, content change, and web persistence by querying supported web archives listed in our [web-archive.txt registry](https://github.com/overbrowsing/web-archive.txt#registry) and the live web. Findings are corroborated across archives rather than relying on a single source, following the Roman maxim testis unus, *testis unus, testis nullus* (one witness is no witness). Built for HPC-scale longitudinal research, *Pluto* supports checkpointing, job sharding, per-archive rate limiting, and queryable Parquet output.
 
 ## Installation
 
