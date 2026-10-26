@@ -1559,17 +1559,31 @@ def discover_candidates(
     raise ValueError(f"scope must be drawn from root/hosts/deep, got {scope!r}")
 
   domain = _discover_normalise_domain(domain)
-  entries = [e for e in compile_archives(registry_dir)
+  all_entries = compile_archives(registry_dir)
+  entries = [e for e in all_entries
        if e.get("cdx_endpoint") and e.get("cdx_access") == "online"]
+  timemap_only: list[str] = []
   if only_archives:
     wanted = {a.strip().lower() for a in only_archives}
     entries = [e for e in entries if e["id"] in wanted]
+    listed = {e["id"] for e in entries}
+    timemap_only = sorted(e["id"] for e in all_entries
+                if e["id"] in wanted and e["id"] not in listed
+                and e.get("timemap_endpoint") and e.get("timemap_access") == "online")
   if not entries:
+    if timemap_only:
+      raise UIError(
+        f"Can't discover URLs for {domain} with {', '.join(timemap_only)} alone: "
+        f"{_plural(len(timemap_only), 'it only offers', 'they only offer')} a Memento timemap, which answers "
+        "for one exact URL at a time and can't list a domain. Add an archive whose CDX can list a "
+        "domain (e.g. --witnesses ia," + ",".join(timemap_only) + "), or pass a URL list with --input.")
     raise UIError("No archives with an online CDX endpoint found in the registry "
             "(run `python pluto.py fetch-archives` first, or check --archives).")
 
   earliest_host: dict[str, str] = {}
   earliest_url: dict[str, str] = {}
+  exact_only: list[str] = []
+  earliest_url_from_listing = [False]
   session = requests.Session()
 
   UI.log("info", f"Searching {len(entries)} {_plural(len(entries), 'archive')} for {domain} ({'/'.join(sorted(scope))})...")
@@ -1580,6 +1594,7 @@ def discover_candidates(
       UI.leaf(f"{entry['id']}: skipped (no collection id on file)", last=last)
       continue
     count = 0
+    deep_seen = False
     stats = {"incomplete": False}
     any_coverage = False
     for base in bases:
@@ -1598,6 +1613,9 @@ def discover_candidates(
         canonical_host = _discover_canonical_host(host)
         if canonical_host not in earliest_host or timestamp < earliest_host[canonical_host]:
           earliest_host[canonical_host] = timestamp
+        if not urlsplit(original_url).path.strip("/"):
+          continue 
+        deep_seen = True
         if not _discover_is_page(mime):
           continue
         if original_url not in earliest_url or timestamp < earliest_url[original_url]:
@@ -1606,7 +1624,21 @@ def discover_candidates(
       UI.leaf(f"{entry['id']}: no coverage", last=last)
       continue
     flag = " (stopped early, likely incomplete: rate-limited or unresponsive)" if stats["incomplete"] else ""
+    if deep_seen:
+      earliest_url_from_listing[0] = True
+    if count and not deep_seen:
+      exact_only.append(entry["id"])
+      flag += " (root pages only: this CDX seems to match exact URLs only, so it can't list deep pages)"
     UI.leaf(f"{entry['id']}: {count:,} {_plural(count, 'capture')}{flag}", last=last)
+  if timemap_only:
+    UI.leaf(f"{', '.join(timemap_only)}: not searched (timemap only; checked per URL in the next stage)", last=True)
+
+  if "deep" in scope and exact_only and not earliest_url_from_listing[0]:
+    UI.log("issue",
+      f"Deep pages can't be discovered from {', '.join(exact_only)} on {_plural(len(exact_only), 'its', 'their')} own: "
+      "exact-match CDX only. Pair with an archive that can list a domain (e.g. --witnesses ia,"
+      + ",".join(exact_only) + "); the URLs it finds are then checked against "
+      + ", ".join(exact_only) + " one by one.")
 
   rows = []
   if "hosts" in scope:
