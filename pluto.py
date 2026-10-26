@@ -1453,6 +1453,13 @@ def _discover_has_coverage(domain: str, cdx_base_url: str, session: requests.Ses
   return "blocked"
 
 
+_PAGE_MIMES = {"text/html", "application/xhtml+xml"}
+
+
+def _discover_is_page(mime: str) -> bool:
+  return (mime or "").split(";")[0].strip().lower() in _PAGE_MIMES
+
+
 def _fetch_domain_captures(domain: str, cdx_base_url: str, session: requests.Session,
                 page_size: int, stats: dict | None = None):
   resume_key = None
@@ -1496,7 +1503,7 @@ def _fetch_domain_captures(domain: str, cdx_base_url: str, session: requests.Ses
       fields = line.split()
       if len(fields) < 3:
         continue
-      yield fields[1], fields[2]
+      yield fields[1], fields[2], (fields[3] if len(fields) > 3 else "-")
 
     if not next_key or next_key == resume_key:
       break
@@ -1583,7 +1590,7 @@ def discover_candidates(
         stats["incomplete"] = True
         continue
       any_coverage = True
-      for timestamp, original_url in _fetch_domain_captures(domain, base, session, page_size, stats):
+      for timestamp, original_url, mime in _fetch_domain_captures(domain, base, session, page_size, stats):
         host = _discover_host(original_url)
         if not _discover_in_domain(host, domain):
           continue
@@ -1591,6 +1598,8 @@ def discover_candidates(
         canonical_host = _discover_canonical_host(host)
         if canonical_host not in earliest_host or timestamp < earliest_host[canonical_host]:
           earliest_host[canonical_host] = timestamp
+        if not _discover_is_page(mime):
+          continue
         if original_url not in earliest_url or timestamp < earliest_url[original_url]:
           earliest_url[original_url] = timestamp
     if not any_coverage and not stats["incomplete"]:
