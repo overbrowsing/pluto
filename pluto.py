@@ -116,9 +116,7 @@ BATCH_SETTINGS = {
   "page_timeout_seconds": 180,
 }
 
-SUSPECT_CDX_CAPS = frozenset({
-  1000, 2000, 5000, 10000, 20000, 25000, 50000, 100000, 150000, 200000, 250000, 300000, 500000, 1000000,
-})
+SUSPECT_CDX_CAPS = frozenset({1000, 2000, 5000, 10000, 20000, 25000, 50000, 100000, 150000, 200000, 250000, 300000, 500000, 1000000})
 
 DEFAULT_CORROBORATION_THRESHOLD = 2
 
@@ -140,7 +138,6 @@ _DROP_PARAMS = {
   "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
   "fbclid", "gclid", "mc_cid", "mc_eid",
 }
-
 
 def canonicalize(raw_url: str) -> str:
   parts = urlsplit(raw_url.strip())
@@ -587,13 +584,13 @@ class LiveWebAdapter(ArchiveAdapter):
   hard_signals = frozenset()
   breaker_signals = frozenset({"dns_failure", "connection_error", "timeout"})
 
-  _DNS_OK_SECONDS = 3600
-  _DNS_FAILED_SECONDS = 20
-
   def __init__(self, config):
     super().__init__(config)
     self._session = _make_session(pool_size=160)
     self._dns: dict[str, tuple[float, str | None]] = {}
+
+  _DNS_OK_SECONDS = 3600
+  _DNS_FAILED_SECONDS = 20
 
   def _check_dns(self, host: str) -> None:
     now = time.monotonic()
@@ -1034,10 +1031,6 @@ class WebArchiveAdapter(ArchiveAdapter):
       return False
 
 
-ADAPTER_REGISTRY = {"LiveWebAdapter": LiveWebAdapter, "WebArchiveAdapter": WebArchiveAdapter}
-
-# ------------------- Host batching -------------------
-
 def _host_key(url: str) -> str:
   try:
     host = urlsplit(url if "://" in url else "http://" + url).hostname or ""
@@ -1060,10 +1053,8 @@ def _match_key(url: str) -> str:
   return f"{host}{path}{'?' + query if query else ''}".lower()
 
 
-CAPTURE_FIELDS = (
-  "capture_time", "memento_url", "mime_type", "status", "digest",
-  "warc_file", "record_id", "query_status", "content_length",
-)
+CAPTURE_FIELDS = ("capture_time", "memento_url", "mime_type", "status", "digest",
+                  "warc_file", "record_id", "query_status", "content_length")
 
 
 def _captures_to_json(rows: list[tuple]) -> str:
@@ -1110,10 +1101,8 @@ class HostBatcher:
     return [("captures", _captures_to_json(rows) if rows else "")]
 
   def _worth_batching(self, host: str) -> bool:
-    return (
-      bool(host) and self.verified is not False and host not in self.per_url_hosts
-      and self.host_counts.get(host, 0) >= self.settings["min_urls_per_host"]
-    )
+    return (bool(host) and self.verified is not False and host not in self.per_url_hosts
+            and self.host_counts.get(host, 0) >= self.settings["min_urls_per_host"])
 
   def _host_index(self, host: str) -> dict | None:
     with self.lock:
@@ -1266,6 +1255,9 @@ class HostBatcher:
     parts = text.split("\n\n")
     key = parts[1].strip() if len(parts) > 1 else ""
     return self._parse(parts[0]), key or None
+
+
+ADAPTER_REGISTRY = {"LiveWebAdapter": LiveWebAdapter, "WebArchiveAdapter": WebArchiveAdapter}
 
 # ------------------- Reliability -------------------
 
@@ -2259,8 +2251,8 @@ def run_witnesses(
   host_of = [_host_key(urls[uid]) for uid in url_ids]
   order = sorted(range(len(url_ids)), key=host_of.__getitem__)
   host_counts: dict[str, int] = {}
-  for host in host_of:
-    host_counts[host] = host_counts.get(host, 0) + 1
+  for h in host_of:
+    host_counts[h] = host_counts.get(h, 0) + 1
   del host_of
   for rt in runtimes.values():
     if getattr(rt.adapter, "batcher", None) is not None:
@@ -2561,10 +2553,8 @@ def run_witnesses(
     batcher = getattr(rt.adapter, "batcher", None)
     if batcher is not None and batcher.stats["answered"]:
       st = batcher.stats
-      logger.info(
-        "%s: %d hosts fetched in %d requests answered %d URLs (%d URLs per-URL, %d hosts too big)",
-        w, st["host_queries"], st["pages"], st["answered"], st["per_url"], st["hosts_too_big"],
-      )
+      logger.info("%s: %d hosts fetched in %d requests answered %d URLs (%d URLs per-URL, %d hosts too big)",
+                  w, st["host_queries"], st["pages"], st["answered"], st["per_url"], st["hosts_too_big"])
   UI.progress(summary, completed + summary["skipped_early_stop"], total_tasks, start_time, tty, final=True)
   if abandoned:
     UI.log("issue", f"Left for the next run (still unreachable): {', '.join(sorted(abandoned))}")
