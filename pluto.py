@@ -30,6 +30,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,21 @@ OUTPUT_SETTINGS = {
   "raw_compress_level": 1,
 }
 
+BATCH_SETTINGS = {
+  "min_urls_per_host": 3,
+  "page_size": 5000,
+  "max_host_rows": 1_500_000,
+  "rows_per_numbered_page": 150_000,
+  "verify_hosts": 8,
+  "cache_rows": 3_000_000,
+  "host_failures_before_fallback": 3,
+  "page_timeout_seconds": 180,
+}
+
+SUSPECT_CDX_CAPS = frozenset({
+  1000, 2000, 5000, 10000, 20000, 25000, 50000, 100000, 150000, 200000, 250000, 300000, 500000, 1000000,
+})
+
 DEFAULT_CORROBORATION_THRESHOLD = 2
 
 CONTENT_REPLACEMENT_LENGTH_RATIO = 0.5
@@ -117,7 +133,6 @@ class WitnessConfig:
   timeout_seconds: float
   requests_per_second: float
   extra: dict
-
 
 # ------------------- Canonicalize -------------------
 
@@ -175,7 +190,6 @@ def split_url(raw_url: str, canonical: str | None = None) -> UrlParts:
 
 def content_digest(content: bytes) -> str:
   return "sha256:" + hashlib.sha256(content).hexdigest()
-
 
 # ------------------- Schema -------------------
 
@@ -273,9 +287,7 @@ def init_tables(output_dir: Path) -> None:
   for table in TABLES:
     table_dir(output_dir, table)
 
-
 # ------------------- Registry -------------------
-
 
 def _endpoint(table: dict, *path: str) -> tuple[str | None, str | None]:
   node = table
@@ -575,17 +587,35 @@ class LiveWebAdapter(ArchiveAdapter):
   hard_signals = frozenset()
   breaker_signals = frozenset({"dns_failure", "connection_error", "timeout"})
 
+  _DNS_OK_SECONDS = 3600
+  _DNS_FAILED_SECONDS = 20
+
   def __init__(self, config):
     super().__init__(config)
     self._session = _make_session(pool_size=160)
+    self._dns: dict[str, tuple[float, str | None]] = {}
+
+  def _check_dns(self, host: str) -> None:
+    now = time.monotonic()
+    checked_at, error = self._dns.get(host, (None, None))
+    max_age = self._DNS_OK_SECONDS if error is None else self._DNS_FAILED_SECONDS
+    remembered = checked_at is not None and now - checked_at <= max_age
+    if not remembered:
+      try:
+        socket.getaddrinfo(host, None)
+        error = None
+      except socket.gaierror as exc:
+        error = str(exc)
+      self._dns[host] = (now, error)
+    if error is not None:
+      exc = WitnessError("dns_failure", error)
+      exc.penalise = not remembered
+      raise exc
 
   def query(self, url: str) -> LiveResponse:
     host = urlsplit(url).hostname
     if host:
-      try:
-        socket.getaddrinfo(host, None)
-      except socket.gaierror as exc:
-        raise WitnessError("dns_failure", str(exc)) from exc
+      self._check_dns(host)
     try:
       response = self._session.get(
         url, headers={"User-Agent": USER_AGENT},
@@ -698,11 +728,27 @@ class WebArchiveAdapter(ArchiveAdapter):
     self.history = config.extra.get("history", "full")
     self._latest_differs = 0
     self._latest_same = 0
+    self.limiter = None
+    self.batcher = HostBatcher(self) if self.entry.usable_cdx() else None
+
+  @property
+  def self_limited(self) -> bool:
+    return self.batcher is not None
 
   def _collection_ids(self) -> list[str | None]:
     return list(self.entry.collections) if self.entry.collections else [self.entry.default_collection]
 
   def query(self, url: str) -> list[tuple[str, str]]:
+    batcher = self.batcher
+    if batcher is not None:
+      answer = batcher.answer(url)
+      if answer is not None:
+        return answer
+      if self.limiter is not None:
+        self.limiter.wait()
+    return self._query_one(url)
+
+  def _query_one(self, url: str) -> list[tuple[str, str]]:
     if self.entry.usable_cdx():
       if self.history == "lifespan":
         return [item for collection in self._collection_ids() for item in self._get_first_and_last(url, collection)]
@@ -787,9 +833,9 @@ class WebArchiveAdapter(ArchiveAdapter):
   def _reassemble(header: list, records: list[list]) -> str:
     return json.dumps([header, *records])
 
-  def _get(self, full_url: str) -> str:
+  def _get(self, full_url: str, timeout: float | None = None) -> str:
     try:
-      resp = self._session.get(full_url, timeout=self.timeout_seconds(),
+      resp = self._session.get(full_url, timeout=timeout or self.timeout_seconds(),
                    headers={"User-Agent": USER_AGENT})
     except ReqTimeout as exc:
       raise WitnessError("timeout", str(exc)) from exc
@@ -815,6 +861,9 @@ class WebArchiveAdapter(ArchiveAdapter):
       if not text.strip() or (kind == "cdx" and self._cdx_is_empty(text)):
         continue
       any_text = True
+      if kind == "captures":
+        all_captures.extend(_captures_from_json(text))
+        continue
       parsed = self._parse_cdx(text) if kind == "cdx" else self._parse_timemap(text)
       if not parsed and (text.lstrip()[:1] == "<" or kind == "cdx"):
         raise WitnessError(
@@ -986,6 +1035,237 @@ class WebArchiveAdapter(ArchiveAdapter):
 
 
 ADAPTER_REGISTRY = {"LiveWebAdapter": LiveWebAdapter, "WebArchiveAdapter": WebArchiveAdapter}
+
+# ------------------- Host batching -------------------
+
+def _host_key(url: str) -> str:
+  try:
+    host = urlsplit(url if "://" in url else "http://" + url).hostname or ""
+  except ValueError:
+    return ""
+  return re.sub(r"^www\d*\.", "", host.lower().rstrip("."))
+
+
+def _match_key(url: str) -> str:
+  try:
+    parts = urlsplit(url if "://" in url else "http://" + url)
+    port = parts.port
+  except ValueError:
+    return url.lower()
+  host = _host_key(url)
+  if port and port not in (80, 443):
+    host = f"{host}:{port}"
+  path = parts.path.rstrip("/") or "/"
+  query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+  return f"{host}{path}{'?' + query if query else ''}".lower()
+
+
+CAPTURE_FIELDS = (
+  "capture_time", "memento_url", "mime_type", "status", "digest",
+  "warc_file", "record_id", "query_status", "content_length",
+)
+
+
+def _captures_to_json(rows: list[tuple]) -> str:
+  return json.dumps([[row[0].isoformat(), *row[1:]] for row in rows], separators=(",", ":"))
+
+
+def _captures_from_json(text: str) -> list[dict]:
+  captures = []
+  for row in json.loads(text):
+    capture = dict(zip(CAPTURE_FIELDS, row))
+    capture["capture_time"] = datetime.fromisoformat(capture["capture_time"])
+    captures.append(capture)
+  return captures
+
+
+class HostBatcher:
+
+  def __init__(self, adapter: "WebArchiveAdapter", settings: dict = BATCH_SETTINGS):
+    self.adapter = adapter
+    self.settings = settings
+    self.host_counts: dict[str, int] = {}
+    self.verified: bool | None = None
+    self.inconclusive_hosts = 0
+    self.paging: str | None = None
+    self.numbered_checked = False
+    self.lock = threading.Lock()
+    self.host_locks: dict[str, threading.Lock] = {}
+    self.cache: OrderedDict[str, dict] = OrderedDict()
+    self.cache_sizes: dict[str, int] = {}
+    self.per_url_hosts: set[str] = set()
+    self.failures: dict[str, int] = {}
+    self.stats = {"host_queries": 0, "pages": 0, "answered": 0, "per_url": 0, "hosts_too_big": 0}
+
+  def answer(self, url: str) -> list[tuple[str, str]] | None:
+    host = _host_key(url)
+    index = self._host_index(host) if self._worth_batching(host) else None
+    if index is None:
+      self.stats["per_url"] += 1
+      return None
+    self.stats["answered"] += 1
+    rows = index.get(_match_key(url), [])
+    if self.adapter.history == "lifespan" and len(rows) > 3:
+      rows = rows[:2] + rows[-1:]
+    return [("captures", _captures_to_json(rows) if rows else "")]
+
+  def _worth_batching(self, host: str) -> bool:
+    return (
+      bool(host) and self.verified is not False and host not in self.per_url_hosts
+      and self.host_counts.get(host, 0) >= self.settings["min_urls_per_host"]
+    )
+
+  def _host_index(self, host: str) -> dict | None:
+    with self.lock:
+      host_lock = self.host_locks.setdefault(host, threading.Lock())
+    with host_lock:
+      index = self._cached(host)
+      if index is None:
+        if host in self.per_url_hosts:
+          return None
+        index = self._fetch_or_give_up(host)
+        if index is None:
+          return None
+        self._remember(host, index)
+    if self.verified is not True and len(index) < 2:
+      return None
+    return index
+
+  def _cached(self, host: str) -> dict | None:
+    with self.lock:
+      index = self.cache.get(host)
+      if index is not None:
+        self.cache.move_to_end(host)
+      return index
+
+  def _fetch_or_give_up(self, host: str) -> dict | None:
+    try:
+      index = self._fetch_host(host)
+    except WitnessError:
+      self.failures[host] = self.failures.get(host, 0) + 1
+      if self.failures[host] >= self.settings["host_failures_before_fallback"]:
+        self.per_url_hosts.add(host)
+      raise
+    if index is None:
+      self.stats["hosts_too_big"] += 1
+      self.per_url_hosts.add(host)
+    return index
+
+  def _remember(self, host: str, index: dict) -> None:
+    with self.lock:
+      self.cache[host] = index
+      self.cache_sizes[host] = sum(len(rows) for rows in index.values())
+      while sum(self.cache_sizes.values()) > self.settings["cache_rows"] and len(self.cache) > 1:
+        old_host, _ = self.cache.popitem(last=False)
+        del self.cache_sizes[old_host]
+      if self.verified is None:
+        if len(index) >= 2:
+          self.verified = True
+        else:
+          self.inconclusive_hosts += 1
+          if self.inconclusive_hosts >= self.settings["verify_hosts"]:
+            self.verified = False
+
+  def _fetch_host(self, host: str) -> dict | None:
+    self.stats["host_queries"] += 1
+    index: dict[str, list[tuple]] = {}
+    total = 0
+    for collection in self.adapter._collection_ids():
+      captures = self._fetch_captures(self._base_url(host, collection))
+      if captures is None:
+        return None
+      total += len(captures)
+      if total > self.settings["max_host_rows"]:
+        return None
+      for capture in captures:
+        row = tuple(capture.get(name) for name in CAPTURE_FIELDS)
+        index.setdefault(_match_key(capture["memento_url"]), []).append(row)
+    now = datetime.now(timezone.utc)
+    for key, rows in index.items():
+      unique = {(r[0], r[1], r[4], r[6]): r for r in rows if r[0] <= now}
+      index[key] = sorted(unique.values(), key=lambda r: r[0])
+    return index
+
+  def _base_url(self, host: str, collection: str | None) -> str:
+    entry = replace(self.adapter.entry, default_collection=collection)
+    endpoint = _fill_template(entry.cdx_endpoint, host, entry)
+    return f"{endpoint}{'&' if '?' in endpoint else '?'}matchType=host&output=json"
+
+  def _get(self, url: str) -> str:
+    if self.adapter.limiter is not None:
+      self.adapter.limiter.wait()
+    self.stats["pages"] += 1
+    text = self.adapter._get(url, timeout=self.settings["page_timeout_seconds"])
+    if text.lstrip()[:1] == "<":
+      raise WitnessError("malformed_response", f"{self.adapter.entry.id} returned HTML for a host query")
+    return text
+
+  def _parse(self, text: str) -> list[dict]:
+    if not text.strip() or self.adapter._cdx_is_empty(text):
+      return []
+    return self.adapter._parse_cdx(text)
+
+  def _fetch_captures(self, base: str) -> list[dict] | None:
+    if self.paging is None and not self.numbered_checked:
+      self.numbered_checked = True
+      if self._get(base + "&showNumPages=true").strip().isdigit():
+        self.paging = "numbered"
+    if self.paging == "numbered":
+      return self._fetch_numbered(base)
+    if self.paging in (None, "resume"):
+      captures = self._fetch_resumable(base)
+      if self.paging != "whole":
+        return captures
+    return self._fetch_whole(base)
+
+  def _fetch_numbered(self, base: str) -> list[dict] | None:
+    pages = int(self._get(base + "&showNumPages=true").strip() or 0)
+    if pages * self.settings["rows_per_numbered_page"] > self.settings["max_host_rows"] * 4:
+      return None
+    captures: list[dict] = []
+    for page in range(pages):
+      captures.extend(self._parse(self._get(f"{base}&page={page}")))
+      if len(captures) > self.settings["max_host_rows"]:
+        return None
+    return captures
+
+  def _fetch_resumable(self, base: str) -> list[dict] | None:
+    page_size = self.settings["page_size"]
+    captures: list[dict] = []
+    key = None
+    while True:
+      url = f"{base}&limit={page_size}&showResumeKey=true"
+      if key:
+        url += f"&resumeKey={quote(key, safe='')}"
+      rows, next_key = self._split_resume(self._get(url))
+      captures.extend(rows)
+      if len(captures) > self.settings["max_host_rows"]:
+        return None
+      if not next_key or next_key == key:
+        break
+      self.paging, key = "resume", next_key
+    if len(rows) >= page_size and self.paging is None:
+      self.paging = "whole"
+    return captures
+
+  def _fetch_whole(self, base: str) -> list[dict] | None:
+    captures = self._parse(self._get(base))
+    if len(captures) in SUSPECT_CDX_CAPS or len(captures) > self.settings["max_host_rows"]:
+      return None
+    return captures
+
+  def _split_resume(self, text: str) -> tuple[list[dict], str | None]:
+    text = text.strip()
+    try:
+      data = json.loads(text) if text else None
+    except json.JSONDecodeError:
+      data = None
+    if isinstance(data, list) and data and isinstance(data[0], list):
+      has_key = len(data) > 1 and len(data[-1]) == 1 and data[-1] != data[0]
+      return self._parse(text), data[-1][0] if has_key else None
+    parts = text.split("\n\n")
+    key = parts[1].strip() if len(parts) > 1 else ""
+    return self._parse(parts[0]), key or None
 
 # ------------------- Reliability -------------------
 
@@ -1778,6 +2058,7 @@ def build_runtimes(witness_configs: list[WitnessConfig], breaker_cfg: dict) -> d
       limiter=RateLimiter(wc.requests_per_second),
       breaker=CircuitBreaker(**cfg),
     )
+    runtimes[wc.name].adapter.limiter = runtimes[wc.name].limiter
   return runtimes
 
 
@@ -1795,7 +2076,8 @@ def _process_unit(uid, witness, original_url, runtime, raw_store, store) -> dict
       breaker.record_failed_health_check()
       return {"outcome": "skipped_circuit_open"}
 
-  runtime.limiter.wait()
+  if not getattr(runtime.adapter, "self_limited", False):
+    runtime.limiter.wait()
   query_time = datetime.now(timezone.utc)
 
   error: WitnessError | None = None
@@ -1807,6 +2089,7 @@ def _process_unit(uid, witness, original_url, runtime, raw_store, store) -> dict
     result = runtime.adapter.parse(original_url, raw)
   except WitnessError as exc:
     error = exc
+    penalise = getattr(exc, "penalise", True)
   except Exception as exc:
     _UNEXPECTED_ERRORS[0] += 1
     logger.error(
@@ -1973,6 +2256,16 @@ def run_witnesses(
       )
   done_bits = _load_done_bits(store, url_ids, witness_names)
 
+  host_of = [_host_key(urls[uid]) for uid in url_ids]
+  order = sorted(range(len(url_ids)), key=host_of.__getitem__)
+  host_counts: dict[str, int] = {}
+  for host in host_of:
+    host_counts[host] = host_counts.get(host, 0) + 1
+  del host_of
+  for rt in runtimes.values():
+    if getattr(rt.adapter, "batcher", None) is not None:
+      rt.adapter.batcher.host_counts = host_counts
+
   obs_buffer: list[dict] = []
   cap_buffer: list[dict] = []
   marks: list[tuple[str, str, str, str | None]] = []
@@ -2020,8 +2313,9 @@ def run_witnesses(
 
   def pending_for(w: str):
     bits = done_bits[w]
-    for i, uid in enumerate(url_ids):
-      if i % _SKIP_SLICE == _SKIP_SLICE - 1:
+    for n, i in enumerate(order):
+      uid = url_ids[i]
+      if n % _SKIP_SLICE == _SKIP_SLICE - 1:
         yield None
       if bits[i >> 3] >> (i & 7) & 1:
         continue
@@ -2263,6 +2557,14 @@ def run_witnesses(
       store.close()
 
   summary["abandoned_witnesses"] = len(abandoned)
+  for w, rt in sorted(runtimes.items()):
+    batcher = getattr(rt.adapter, "batcher", None)
+    if batcher is not None and batcher.stats["answered"]:
+      st = batcher.stats
+      logger.info(
+        "%s: %d hosts fetched in %d requests answered %d URLs (%d URLs per-URL, %d hosts too big)",
+        w, st["host_queries"], st["pages"], st["answered"], st["per_url"], st["hosts_too_big"],
+      )
   UI.progress(summary, completed + summary["skipped_early_stop"], total_tasks, start_time, tty, final=True)
   if abandoned:
     UI.log("issue", f"Left for the next run (still unreachable): {', '.join(sorted(abandoned))}")
